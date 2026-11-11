@@ -1,0 +1,22 @@
+﻿# Unreal Engine
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.user
+*.userprefs
+
+# Rust
+**/target/
+Cargo.lock
