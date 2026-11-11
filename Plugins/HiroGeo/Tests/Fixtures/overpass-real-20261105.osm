@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="Overpass API 0.7.62.11 87bfad18">
+  <note>The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.</note>
+  <meta osm_base="2026-11-05T03:46:19Z"/>
+  <bounds minlat="35.6990000" minlon="51.3990000" maxlat="35.7000000" maxlon="51.4000000"/>
+  <node id="2044004485" lat="35.6997212" lon="51.3993323" version="3"/>
+  <node id="2044004512" lat="35.6997209" lon="51.4002954" version="10"/>
+  <node id="12214828171" lat="35.6998852" lon="51.3994869" version="1"/>
+  <node id="12214828172" lat="35.7000792" lon="51.3995187" version="1"/>
+  <node id="12214828173" lat="35.7000771" lon="51.3996585" version="1"/>
+  <node id="12214828174" lat="35.6998759" lon="51.3996267" version="1"/>
+  <node id="12214828175" lat="35.7000628" lon="51.3989685" version="1"/>
+  <node id="12214828176" lat="35.7000651" lon="51.3990951" version="1"/>
+  <node id="12214828177" lat="35.6998489" lon="51.3990632" version="1"/>
+  <node id="12214828178" lat="35.6998359" lon="51.3990402" version="1"/>
+  <node id="12214828179" lat="35.6998338" lon="51.3989694" version="1"/>
+  <node id="12214828180" lat="35.6998533" lon="51.3989367" version="1"/>
+  <node id="13039387140" lat="35.6998371" lon="51.3993081" version="1"/>
+  <node id="13039387141" lat="35.7000752" lon="51.3993349" version="1"/>
+  <node id="13039387142" lat="35.7000796" lon="51.3992357" version="1"/>
+  <node id="13039387143" lat="35.6998453" lon="51.3991981" version="1"/>
+  <way id="193891791" version="4">
+    <nd ref="2044004485"/>
+    <nd ref="2044004512"/>
+    <tag k="highway" v="residential"/>
+    <tag k="maxspeed" v="30"/>
+    <tag k="name" v="هادی خداپرست"/>
+  </way>
+  <way id="1319951403" version="1">
+    <nd ref="12214828171"/>
+    <nd ref="12214828172"/>
+    <nd ref="12214828173"/>
+    <nd ref="12214828174"/>
+    <nd ref="12214828171"/>
+    <tag k="building" v="apartments"/>
+  </way>
+  <way id="1319951404" version="1">
+    <nd ref="12214828175"/>
+    <nd ref="12214828176"/>
+    <nd ref="12214828177"/>
+    <nd ref="12214828178"/>
+    <nd ref="12214828179"/>
+    <nd ref="12214828180"/>
+    <nd ref="12214828175"/>
+    <tag k="building" v="apartments"/>
+  </way>
+  <way id="1418929478" version="1">
+    <nd ref="13039387140"/>
+    <nd ref="13039387141"/>
+    <nd ref="13039387142"/>
+    <nd ref="13039387143"/>
+    <nd ref="13039387140"/>
+    <tag k="building" v="apartments"/>
+  </way>
+</osm>

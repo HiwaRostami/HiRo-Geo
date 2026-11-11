@@ -1,0 +1,47 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0",
+    "FriendlyName": "HiroGeo",
+    "Description": "Urban Space Generation Plugin using CGAL",
+    "Category": "Rendering",
+    "CanContainContent": true,
+    "IsBetaVersion": false,
+    "Installed": false,
+    "Modules": [
+        {
+            "Name": "HiroGeoCGAL",
+            "Type": "Runtime",
+            "LoadingPhase": "PreDefault",
+            "PlatformAllowList": [ "Win64" ]
+        },
+        {
+            "Name": "HiroGeo",
+            "Type": "Runtime",
+            "LoadingPhase": "Default",
+            "PlatformAllowList": [ "Win64" ]
+        },
+        {
+            "Name": "HiroGeoLERC",
+            "Type": "Runtime",
+            "LoadingPhase": "PreDefault",
+            "PlatformAllowList": [ "Win64" ]
+        },
+        {
+            "Name": "HiroGeoEditor",
+            "Type": "Editor",
+            "LoadingPhase": "Default",
+            "PlatformAllowList": [ "Win64" ]
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "ProceduralMeshComponent",
+            "Enabled": true
+        },
+        {
+            "Name": "WebBrowserWidget",
+            "Enabled": true
+        }
+    ]
+}

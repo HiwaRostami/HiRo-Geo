@@ -1,0 +1,14 @@
+فایل  هایی که تغییر دادی. و باید به حالت قبل از ساخت پل برگردانی
+
+Osmloader.cpp
+
+Geomeshgenerator.cpp
+
+Geojsonloader.h
+
+Geojsonloader.cpp
+
+Hirogeoactor.cpp
+
+shirogeoimporterwindow.cpp
+

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="HiroGeo deterministic fixture">
+  <bounds minlat="35.6990" minlon="51.3990" maxlat="35.7000" maxlon="51.4000"/>
+  <node id="1" lat="35.69920" lon="51.39920"/>
+  <node id="2" lat="35.69920" lon="51.39940"/>
+  <node id="3" lat="35.69940" lon="51.39940"/>
+  <node id="4" lat="35.69940" lon="51.39920"/>
+  <node id="5" lat="35.69955" lon="51.39915"/>
+  <node id="6" lat="35.69955" lon="51.39955"/>
+  <node id="7" lat="35.69990" lon="51.39955"/>
+  <node id="8" lat="35.69990" lon="51.39915"/>
+  <node id="9" lat="35.69910" lon="51.39970"/>
+  <node id="10" lat="35.69950" lon="51.39975"/>
+  <node id="11" lat="35.69990" lon="51.39980"/>
+  <node id="12" lat="35.69972" lon="51.39935">
+    <tag k="natural" v="tree"/>
+  </node>
+  <way id="100">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/><nd ref="4"/><nd ref="1"/>
+    <tag k="building" v="yes"/>
+    <tag k="height" v="12"/>
+    <tag k="roof:shape" v="gabled"/>
+  </way>
+  <way id="101">
+    <nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/>
+    <tag k="landuse" v="forest"/>
+  </way>
+  <way id="102">
+    <nd ref="9"/><nd ref="10"/><nd ref="11"/>
+    <tag k="railway" v="rail"/>
+    <tag k="gauge" v="1435"/>
+  </way>
+</osm>

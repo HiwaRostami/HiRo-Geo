@@ -10,13 +10,21 @@ Saved/
 *.sdf
 *.VC.db
 *.VC.opendb
+**/Binaries/
+**/Intermediate/
+**/DerivedDataCache/
 
 # OS / IDE
 .DS_Store
 Thumbs.db
 *.user
 *.userprefs
+.vsconfig
+
+# Node / Streets GL deps
+**/node_modules/
+streets-gl/build/
+streets-gl/dist/
 
 # Rust
 **/target/
-Cargo.lock
