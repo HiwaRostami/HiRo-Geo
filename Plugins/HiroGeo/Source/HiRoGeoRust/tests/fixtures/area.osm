@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<osm version="0.6" generator="HiRo Geo test">
+  <node id="1" lon="8.530" lat="47.370"/>
+  <node id="2" lon="8.540" lat="47.370"/>
+  <node id="3" lon="8.540" lat="47.380"/>
+  <node id="4" lon="8.530" lat="47.380"/>
+  <node id="5" lon="8.533" lat="47.373"/>
+  <node id="6" lon="8.534" lat="47.373"/>
+  <node id="7" lon="8.534" lat="47.374"/>
+  <node id="8" lon="8.533" lat="47.374"/>
+  <node id="9" lon="8.550" lat="47.370"/>
+  <node id="10" lon="8.551" lat="47.370"/>
+  <node id="11" lon="8.551" lat="47.371"/>
+  <way id="20"><nd ref="1"/><nd ref="2"/><nd ref="3"/></way>
+  <way id="21"><nd ref="1"/><nd ref="4"/><nd ref="3"/></way>
+  <way id="22"><nd ref="5"/><nd ref="6"/><nd ref="7"/><nd ref="8"/><nd ref="5"/></way>
+  <way id="23"><nd ref="9"/><nd ref="10"/><nd ref="11"/><nd ref="9"/></way>
+  <way id="30"><nd ref="9"/><nd ref="10"/><nd ref="11"/><nd ref="9"/><tag k="building" v="yes"/></way>
+  <way id="31"><nd ref="9"/><nd ref="10"/><nd ref="11"/><nd ref="9"/><tag k="building:part" v="yes"/><tag k="min_height" v="4"/></way>
+  <way id="32"><nd ref="9"/><nd ref="10"/><tag k="highway" v="service"/><tag k="name" v="A &amp; B"/></way>
+  <way id="33"><nd ref="9"/><nd ref="999"/><tag k="highway" v="service"/></way>
+  <relation id="40">
+    <member type="way" ref="20" role="outer"/>
+    <member type="way" ref="21" role="outer"/>
+    <member type="way" ref="22" role="inner"/>
+    <member type="way" ref="23" role="outer"/>
+    <tag k="type" v="multipolygon"/><tag k="natural" v="water"/>
+  </relation>
+</osm>

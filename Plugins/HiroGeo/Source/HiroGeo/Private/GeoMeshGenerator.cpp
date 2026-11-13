@@ -4537,25 +4537,6 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
         const bool bDeform = bHaveDem || bHaveSamples;
         const double RoadRefElev = bHaveDem ? DemHeightmap->SampleAtLatLon(OriginLatitude, OriginLongitude)
                 : (bHaveSamples ? ComputeElevationSamplesRefElev(*ElevationSamples) : 0.0);
-        // Junction caps are generated in the first pass, before each ribbon's TZ
-        // array exists. Sample their endpoint height here so caps use the same
-        // mesh-local (DEM - RoadRefElev) frame as the road/sidewalk ribbons.
-        // Leaving these at Z≈0 made dark, flat intersection disks visibly detach
-        // from sloped roads by the full terrain relief.
-        auto SampleRoadTerrainOffsetUE = [&](const FVector2D& LocalPoint) -> float
-        {
-                if (bHaveDem)
-                {
-                        return SampleDemOffsetUE(DemHeightmap, OriginLatitude, OriginLongitude,
-                                RoadRefElev, ScaleFactor, LocalPoint.X, LocalPoint.Y);
-                }
-                if (bHaveSamples)
-                {
-                        return SampleElevationSamplesOffsetUE(*ElevationSamples, RoadRefElev,
-                                ScaleFactor, LocalPoint.X, LocalPoint.Y);
-                }
-                return 0.f;
-        };
         const FColor RoadColor(60, 60, 60), SidewalkColor(180, 175, 170);
         // Layer the surfaces at distinct, small heights above the ground so the
         // road, sidewalk and curb never sit coplanar with the ground or with
@@ -4591,57 +4572,11 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                 }
         };
 
-        // Fill a road junction / end with a flat asphalt cap so trimmed ribbon
-        // ends read as a single filled surface (streets.gl roadwayIntersection).
-        // Caps use the unmarked-asphalt slice (1) so no lane markings cross the
-        // intersection, and sit a hair above the ribbons to hide coplanar overlap.
-        auto AddJunctionCap = [&](FMeshData& MD, const FVector2D& C, float R, float Z, int32 Layer,
-                const FColor& Col)
-        {
-                const int32 Seg = 16; // smoother disk — fewer faceted star edges
-                const float Slice = 1.f; // unmarked asphalt
-                const int32 CI = MD.Vertices.Num();
-                auto PushV = [&](const FVector2D& P, const FVector2D& UV)
-                {
-                        MD.Vertices.Add(FVector(P.X, P.Y, SampleGroundZ && Layer == 0 ? SampleGroundZ(P) + 10.5 : Z));
-                        MD.Normals.Add(FVector(0, 0, 1));
-                        MD.VertexColors.Add(Col);
-                        MD.Tangents.Add(FProcMeshTangent(FVector(1, 0, 0), false));
-                        MD.UV0.Add(UV);
-                        MD.UV1.Add(FVector2D(Slice, 0.f));
-                };
-                PushV(C, FVector2D(0.5f, 0.5f));
-                for (int32 s = 0; s <= Seg; s++)
-                {
-                        const float A = (2.f * PI * s) / Seg;
-                        const FVector2D Dir(FMath::Cos(A), FMath::Sin(A));
-                        PushV(C + Dir * R, FVector2D(0.5f + Dir.X * 0.5f, 0.5f + Dir.Y * 0.5f));
-                }
-                // Same CCW winding (in XY) as the road ribbon quads, so the caps end
-                // up with the identical face normal and shade exactly like the road.
-                for (int32 s = 0; s < Seg; s++)
-                {
-                        MD.Triangles.Add(CI);
-                        MD.Triangles.Add(CI + 1 + s);
-                        MD.Triangles.Add(CI + 1 + s + 1);
-                }
-        };
-
-        // Junctions where several roads meet (interchange/complex intersection)
-        // each drew their OWN small cap sized only to their own half-width —
-        // too small to cover every other road converging at the same point,
-        // leaving lane-marking stripes from crossing ribbons showing through in
-        // a chaotic star pattern. Instead, collect ALL roads' endpoints here and
-        // emit ONE cap per shared junction point, sized to the widest road that
-        // actually meets there.
         struct FJunctionInfo
         {
-                FVector2D Pos;
                 float MaxHW = 0.f;
-                float Z = 0.f;
-                TArray<TPair<FVector2D, float>> Arms; // direction into road + half-width
-                TMap<FColor, int32> MaterialVotes;    // streets-gl majority material at junction
-                FColor CapColor = FColor(60, 60, 60);
+                TArray<TPair<FVector2D, float>> Arms;
+                TArray<FVector> Mouths;
         };
         TMap<FIntVector, FJunctionInfo> Junctions;
         auto NeedsJunctionSurface = [](const FJunctionInfo& Junction)
@@ -4659,31 +4594,9 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
         {
                 return FIntVector(FMath::RoundToInt(P.X / JunctionSnap), FMath::RoundToInt(P.Y / JunctionSnap), Layer);
         };
-        auto RegisterJunction = [&Junctions, &JKey](const FVector2D& P, int32 Layer, float HW, float Z, FColor Col)
+        auto IsVehicleRoad = [](const FString& HWType)
         {
-                FIntVector K = JKey(P, Layer);
-                FJunctionInfo& J = Junctions.FindOrAdd(K);
-                if (J.MaxHW == 0.f) J.Pos = P;
-                J.MaxHW = FMath::Max(J.MaxHW, HW);
-                J.Z = J.MaterialVotes.IsEmpty() ? Z : FMath::Max(J.Z, Z);
-                J.MaterialVotes.FindOrAdd(Col)++;
-                // Majority vote for cap colour (asphalt vs concrete etc.).
-                int32 Best = 0;
-                for (const auto& Vote : J.MaterialVotes)
-                {
-                        if (Vote.Value > Best) { Best = Vote.Value; J.CapColor = Vote.Key; }
-                }
-        };
-
-        // Pass 1 — register junctions / arms before drawing so ribbons can trim
-        // back from intersection polygons (streets-gl RoadGraph.trimTo).
-        for (const FGeoRoad& Road : Roads)
-        {
-                const TArray<FVector2D> RPts = ResamplePolylineForTerrain(Road.Points, 5.f, /*bClosed*/ false);
-                const int32 N = RPts.Num();
-                if (N < 2) continue;
-                const FString HWType = Road.RoadTypeStr.ToLower();
-                const bool bVehicleRoad = !(
+                return !(
                         HWType == TEXT("footway")   || HWType == TEXT("path")    ||
                         HWType == TEXT("cycleway")  || HWType == TEXT("steps")   ||
                         HWType == TEXT("pedestrian")|| HWType == TEXT("track")   ||
@@ -4691,6 +4604,50 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                         HWType == TEXT("platform")  || HWType == TEXT("construction") ||
                         HWType == TEXT("proposed")  || HWType == TEXT("runway") ||
                         HWType == TEXT("taxiway")   || HWType.IsEmpty());
+        };
+
+        // Split only at original shared vertices, before adding terrain samples.
+        // Interior bends on a single way retain their continuous ribbon.
+        TMap<FIntVector, int32> VertexUses;
+        auto RoadKey = [&](const FVector2D& Point, int32 Layer)
+        {
+                return JKey(FVector2D(Point.X * ScaleFactor, -Point.Y * ScaleFactor), Layer);
+        };
+        for (const FGeoRoad& Road : Roads)
+        {
+                if (Road.Points.Num() < 2 || !IsVehicleRoad(Road.RoadTypeStr.ToLower())) continue;
+                for (const FVector2D& Point : Road.Points)
+                        ++VertexUses.FindOrAdd(RoadKey(Point, Road.Layer));
+        }
+
+        TArray<FGeoRoad> Sections;
+        for (const FGeoRoad& Road : Roads)
+        {
+                if (Road.Points.Num() < 2) continue;
+                if (!IsVehicleRoad(Road.RoadTypeStr.ToLower()) || Road.Layer != 0)
+                {
+                        Sections.Add(Road);
+                        continue;
+                }
+
+                int32 Start = 0;
+                for (int32 End = 1; End < Road.Points.Num(); ++End)
+                {
+                        if (End != Road.Points.Num() - 1 && VertexUses.FindRef(RoadKey(Road.Points[End], Road.Layer)) < 2)
+                                continue;
+                        FGeoRoad& Section = Sections.Add_GetRef(Road);
+                        Section.Points.Reset(End - Start + 1);
+                        Section.Points.Append(Road.Points.GetData() + Start, End - Start + 1);
+                        Start = End;
+                }
+        }
+
+        for (const FGeoRoad& Road : Sections)
+        {
+                const TArray<FVector2D> RPts = ResamplePolylineForTerrain(Road.Points, 5.f, false);
+                const int32 N = RPts.Num();
+                if (N < 2) continue;
+                const bool bVehicleRoad = IsVehicleRoad(Road.RoadTypeStr.ToLower());
                 if (!bVehicleRoad) continue;
 
                 const float RW = Road.Width > 0.f ? Road.Width * ScaleFactor : 600.f;
@@ -4700,27 +4657,19 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                 for (int32 i = 0; i < N; i++)
                         Pts.Add(FVector2D(RPts[i].X * ScaleFactor, -RPts[i].Y * ScaleFactor));
 
-                // Layer ends ramp to ~0 so approach roads meet bridges smoothly;
-                // junction caps therefore sit near ground at endpoints.
-                float Z0 = RoadZ + 0.5f + SampleRoadTerrainOffsetUE(RPts[0]);
-                float ZN = RoadZ + 0.5f + SampleRoadTerrainOffsetUE(RPts[N - 1]);
-                RegisterJunction(Pts[0], Road.Layer, HW, Z0, RoadColor);
-                RegisterJunction(Pts[N - 1], Road.Layer, HW, ZN, RoadColor);
                 auto AddArm = [&](const FVector2D& At, const FVector2D& Into)
                 {
-                        FIntVector K = JKey(At, Road.Layer);
-                        if (FJunctionInfo* J = Junctions.Find(K))
-                        {
-                                FVector2D Dir = (Into - At).GetSafeNormal();
-                                if (!Dir.IsNearlyZero())
-                                        J->Arms.Add(TPair<FVector2D, float>(Dir, HW));
-                        }
+                        const FVector2D Dir = (Into - At).GetSafeNormal();
+                        if (Dir.IsNearlyZero()) return;
+                        FJunctionInfo& J = Junctions.FindOrAdd(JKey(At, Road.Layer));
+                        J.MaxHW = FMath::Max(J.MaxHW, HW);
+                        J.Arms.Emplace(Dir, HW);
                 };
                 AddArm(Pts[0], Pts[1]);
                 AddArm(Pts[N - 1], Pts[N - 2]);
         }
 
-        for (const FGeoRoad& Road : Roads)
+        for (const FGeoRoad& Road : Sections)
         {
                 const TArray<FVector2D> RPts = ResamplePolylineForTerrain(Road.Points, 5.f, /*bClosed*/ false);
                 const int32 N = RPts.Num();
@@ -4734,14 +4683,7 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                 // bit LOWER than vehicle roads so a footway crossing a road is covered
                 // by the road instead of cutting a light strip across the asphalt.
                 const FString HWType = Road.RoadTypeStr.ToLower();
-                const bool bVehicleRoad = !(
-                        HWType == TEXT("footway")   || HWType == TEXT("path")    ||
-                        HWType == TEXT("cycleway")  || HWType == TEXT("steps")   ||
-                        HWType == TEXT("pedestrian")|| HWType == TEXT("track")   ||
-                        HWType == TEXT("bridleway") || HWType == TEXT("corridor")||
-                        HWType == TEXT("platform")  || HWType == TEXT("construction") ||
-                        HWType == TEXT("proposed")  || HWType == TEXT("runway") ||
-                        HWType == TEXT("taxiway")   || HWType.IsEmpty());
+                const bool bVehicleRoad = IsVehicleRoad(HWType);
 
                 // streets-gl: sidewalk ribbons ONLY when sidewalk=* is tagged.
                 // Motorways/trunk never get pedestrian sidewalks even if mistagged.
@@ -4782,7 +4724,7 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                 // instead of sitting on one flat plane. All zero when no DEM is set.
                 TArray<float> TZ;
                 TZ.SetNumZeroed(N);
-                if (bDeform)
+                if (bDeform && !SampleGroundZ)
                 {
                         for (int32 i = 0; i < N; i++)
                         {
@@ -4846,12 +4788,15 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
 
                 // streets-gl RoadGraph: pull ribbon ends back into multi-arm junctions
                 // so lane markings stop at the intersection polygon (trimmedEnd).
-                auto TrimEnd = [&](int32 EndIdx, int32 TowardIdx)
+                FJunctionInfo* StartJunction = nullptr;
+                FJunctionInfo* EndJunction = nullptr;
+                auto TrimEnd = [&](int32 EndIdx, int32 TowardIdx, FJunctionInfo*& Junction)
                 {
                         const FIntVector K = JKey(Pts[EndIdx], Road.Layer);
-                        const FJunctionInfo* J = Junctions.Find(K);
+                        FJunctionInfo* J = Junctions.Find(K);
                         if (!J || !NeedsJunctionSurface(*J)) return;
-                        const float Want = J->MaxHW * 1.25f;
+                        Junction = J;
+                        const float Want = J->MaxHW;
                         FVector2D Delta = Pts[TowardIdx] - Pts[EndIdx];
                         const float Len = Delta.Size();
                         if (Len < 50.f) return;
@@ -4861,10 +4806,10 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                         TZ[EndIdx] = FMath::Lerp(TZ[EndIdx], TZ[TowardIdx], T);
                         AlongDist[EndIdx] = FMath::Lerp(AlongDist[EndIdx], AlongDist[TowardIdx], T);
                 };
-                if (N >= 2)
+                if (bVehicleRoad)
                 {
-                        TrimEnd(0, 1);
-                        TrimEnd(N - 1, N - 2);
+                        TrimEnd(0, 1, StartJunction);
+                        TrimEnd(N - 1, N - 2, EndJunction);
                 }
 
                 // Cumulative V along the road. Use a FIXED real-world tile length
@@ -4888,75 +4833,86 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                         return TPair<FVector2D, FVector2D>(P + Nrm * Half, P - Nrm * Half);
                 };
 
-                auto RoadVertex = [&](const FVector2D& P, float Z, float SurfaceOffset)
+                auto RoadVertex = [&](const FVector2D& P, float Z)
                 {
-                        return FVector(P.X, P.Y, SampleGroundZ && Road.Layer == 0
-                                ? SampleGroundZ(P) + 5.0 + SurfaceOffset : Z);
+                        return FVector(P.X, P.Y, SampleGroundZ
+                                ? SampleGroundZ(P) + 5.0 + Z : Z);
                 };
+
+                auto AddMouth = [&](FJunctionInfo* Junction, int32 End, int32 Neighbor)
+                {
+                        if (!Junction) return;
+                        const FVector2D Normal = EdgeNormal(Pts[End], Pts[Neighbor]);
+                        Junction->Mouths.Add(RoadVertex(Pts[End] + Normal * HW, SurfZ + TZ[End]));
+                        Junction->Mouths.Add(RoadVertex(Pts[End] - Normal * HW, SurfZ + TZ[End]));
+                };
+                AddMouth(StartJunction, 0, 1);
+                AddMouth(EndJunction, N - 1, N - 2);
 
                 auto EmitRibbonSeg = [&](FMeshData& MD, const FVector2D& L0, const FVector2D& R0,
                         const FVector2D& L1, const FVector2D& R1, float Z0, float Z1,
-                        float V0, float V1, const FColor& Col, float Slice, float SurfaceOffset)
+                        float V0, float V1, const FColor& Col, float Slice)
                 {
                         AddRoadQuad(MD,
-                                RoadVertex(R0, Z0, SurfaceOffset), RoadVertex(L0, Z0, SurfaceOffset),
-                                RoadVertex(L1, Z1, SurfaceOffset), RoadVertex(R1, Z1, SurfaceOffset),
+                                RoadVertex(R0, Z0), RoadVertex(L0, Z0),
+                                RoadVertex(L1, Z1), RoadVertex(R1, Z1),
                                 Col,
                                 FVector2D(0.f, V0), FVector2D(1.f, V0),
                                 FVector2D(1.f, V1), FVector2D(0.f, V1),
                                 Slice);
                 };
 
-                // Bevel / limited-miter join at interior vertex (streets-gl connection tris).
-                auto EmitJoin = [&](FMeshData& MD, const FVector2D& P,
-                        const FVector2D& NPrev, const FVector2D& NNext,
-                        float Half, float Z, float V, const FColor& Col, float Slice)
+                // The inside edges already overlap at a bend. Fill only the
+                // outside wedge so the join does not cross the two ribbons.
+                auto EmitJoin = [&](const FVector2D& P, const FVector2D& NPrev,
+                        const FVector2D& NNext, float Z, float V)
                 {
-                        const FVector2D LPrev = P + NPrev * Half;
-                        const FVector2D RPrev = P - NPrev * Half;
-                        const FVector2D LNext = P + NNext * Half;
-                        const FVector2D RNext = P - NNext * Half;
+                        const double Turn = FVector2D::CrossProduct(NPrev, NNext);
+                        if (FMath::Abs(Turn) <= UE_DOUBLE_SMALL_NUMBER) return;
+                        const double Side = Turn > 0.0 ? 1.0 : -1.0;
+                        FVector2D A = P + NPrev * (HW * Side);
+                        FVector2D B = P + NNext * (HW * Side);
+                        if (Turn < 0.0) Swap(A, B);
 
-                        // Nearly colinear — segment rails already meet.
-                        if (FVector2D::DistSquared(LPrev, LNext) < 4.f
-                                && FVector2D::DistSquared(RPrev, RNext) < 4.f)
+                        const int32 Start = OutRoadData.Vertices.Num();
+                        AddTriangle(OutRoadData, RoadVertex(P, Z), RoadVertex(A, Z),
+                                RoadVertex(B, Z), RoadColor);
+                        OutRoadData.UV0[Start] = FVector2D(0.5, V);
+                        const double EdgeU = Turn > 0.0 ? 1.0 : 0.0;
+                        OutRoadData.UV0[Start + 1] = FVector2D(EdgeU, V);
+                        OutRoadData.UV0[Start + 2] = FVector2D(EdgeU, V + FVector2D::Distance(A, B) / RoadTileLen);
+                        for (int32 Corner = 0; Corner < 3; ++Corner)
+                                OutRoadData.UV1.Emplace(bVehicleRoad ? 1.f : RoadSlice, 0.f);
+                        const bool bLeft = Side > 0.0;
+                        const bool bCycleway = bLeft ? bCWLeft : bCWRight;
+                        const bool bSidewalk = bLeft ? bSWLeft : bSWRight;
+                        auto JoinEdges = [&](float Inner, float Outer)
                         {
-                                return;
+                                const FVector2D First = Turn > 0.0 ? NPrev : NNext;
+                                const FVector2D Second = Turn > 0.0 ? NNext : NPrev;
+                                return TArray<FVector2D, TInlineAllocator<4>>{
+                                        P + First * (Inner * Side), P + First * (Outer * Side),
+                                        P + Second * (Outer * Side), P + Second * (Inner * Side)};
+                        };
+                        const float TerrainZ = Z - SurfZ;
+                        if (bCycleway)
+                        {
+                                const auto E = JoinEdges(HW, OH_CW);
+                                const float Top = CycleZ + TerrainZ;
+                                AddRoadQuad(OutRoadData, RoadVertex(E[0], Top), RoadVertex(E[1], Top),
+                                        RoadVertex(E[2], Top), RoadVertex(E[3], Top),
+                                        CycleColor, {0.f, V}, {1.f, V}, {1.f, V + 0.1f}, {0.f, V + 0.1f}, 2.f);
                         }
-
-                        FVector2D M = (NPrev + NNext).GetSafeNormal();
-                        if (M.IsNearlyZero()) M = NNext;
-                        const float C = FVector2D::DotProduct(M, NNext);
-                        // streets-gl clamps extreme miters; beyond ~2x half-width use a
-                        // simple bevel quad between the two edge offsets.
-                        const bool bUseMiter = FMath::Abs(C) > 0.5f;
-                        if (bUseMiter)
+                        if (bSidewalk)
                         {
-                                const float MiterScale = FMath::Clamp(1.f / C, -2.f, 2.f);
-                                const FVector2D LM = P + M * (Half * MiterScale);
-                                const FVector2D RM = P - M * (Half * MiterScale);
-                                AddRoadQuad(MD,
-                                        RoadVertex(RPrev, Z, SurfZ), RoadVertex(LPrev, Z, SurfZ),
-                                        RoadVertex(LM, Z, SurfZ), RoadVertex(RM, Z, SurfZ),
-                                        Col,
-                                        FVector2D(0.f, V), FVector2D(1.f, V),
-                                        FVector2D(1.f, V), FVector2D(0.f, V), Slice);
-                                AddRoadQuad(MD,
-                                        RoadVertex(RM, Z, SurfZ), RoadVertex(LM, Z, SurfZ),
-                                        RoadVertex(LNext, Z, SurfZ), RoadVertex(RNext, Z, SurfZ),
-                                        Col,
-                                        FVector2D(0.f, V), FVector2D(1.f, V),
-                                        FVector2D(1.f, V), FVector2D(0.f, V), Slice);
-                        }
-                        else
-                        {
-                                // Sharp bend: bevel quad bridging the two edge frames.
-                                AddRoadQuad(MD,
-                                        RoadVertex(RPrev, Z, SurfZ), RoadVertex(LPrev, Z, SurfZ),
-                                        RoadVertex(LNext, Z, SurfZ), RoadVertex(RNext, Z, SurfZ),
-                                        Col,
-                                        FVector2D(0.f, V), FVector2D(1.f, V),
-                                        FVector2D(1.f, V), FVector2D(0.f, V), Slice);
+                                const float Inner = bCycleway ? OH_CW : HW;
+                                const auto E = JoinEdges(Inner, Inner + SWExtra);
+                                const float Top = SidewalkZ + TerrainZ;
+                                AddQuad(OutSidewalkData, RoadVertex(E[0], Top), RoadVertex(E[1], Top),
+                                        RoadVertex(E[2], Top), RoadVertex(E[3], Top), SidewalkColor);
+                                AddQuad(OutSidewalkData, RoadVertex(E[0], RoadZ + TerrainZ),
+                                        RoadVertex(E[0], Top), RoadVertex(E[3], Top),
+                                        RoadVertex(E[3], RoadZ + TerrainZ), SidewalkColor);
                         }
                 };
 
@@ -4971,21 +4927,21 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                         const float Z1 = SurfZ + TZ[i + 1];
 
                         EmitRibbonSeg(OutRoadData, Road0.Key, Road0.Value, Road1.Key, Road1.Value,
-                                Z0, Z1, VAlong[i], VAlong[i + 1], RoadColor, RoadSlice, SurfZ);
+                                Z0, Z1, VAlong[i], VAlong[i + 1], RoadColor, RoadSlice);
 
                         if (bCWLeft)
                         {
                                 const auto A0 = OffsetAt(Pts[i], Nrm, OH_CW);
                                 const auto A1 = OffsetAt(Pts[i + 1], Nrm, OH_CW);
                                 EmitRibbonSeg(OutRoadData, A0.Key, Road0.Key, A1.Key, Road1.Key,
-                                        CycleZ + TZ[i], CycleZ + TZ[i + 1], VAlong[i], VAlong[i + 1], CycleColor, 2.f, CycleZ);
+                                        CycleZ + TZ[i], CycleZ + TZ[i + 1], VAlong[i], VAlong[i + 1], CycleColor, 2.f);
                         }
                         if (bCWRight)
                         {
                                 const auto A0 = OffsetAt(Pts[i], Nrm, OH_CW);
                                 const auto A1 = OffsetAt(Pts[i + 1], Nrm, OH_CW);
                                 EmitRibbonSeg(OutRoadData, Road0.Value, A0.Value, Road1.Value, A1.Value,
-                                        CycleZ + TZ[i], CycleZ + TZ[i + 1], VAlong[i], VAlong[i + 1], CycleColor, 2.f, CycleZ);
+                                        CycleZ + TZ[i], CycleZ + TZ[i + 1], VAlong[i], VAlong[i + 1], CycleColor, 2.f);
                         }
 
                         const float OH_L = HW + SWExtra + (bCWLeft  ? CWExtra : 0.f);
@@ -4998,16 +4954,16 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                                 const auto Outer0 = OffsetAt(Pts[i], Nrm, OH_L);
                                 const auto Outer1 = OffsetAt(Pts[i + 1], Nrm, OH_L);
                                 AddQuad(OutSidewalkData,
-                                        RoadVertex(Inner0.Key, SidewalkZ + TZ[i], SidewalkZ),
-                                        RoadVertex(Outer0.Key, SidewalkZ + TZ[i], SidewalkZ),
-                                        RoadVertex(Outer1.Key, SidewalkZ + TZ[i + 1], SidewalkZ),
-                                        RoadVertex(Inner1.Key, SidewalkZ + TZ[i + 1], SidewalkZ),
+                                        RoadVertex(Inner0.Key, SidewalkZ + TZ[i]),
+                                        RoadVertex(Outer0.Key, SidewalkZ + TZ[i]),
+                                        RoadVertex(Outer1.Key, SidewalkZ + TZ[i + 1]),
+                                        RoadVertex(Inner1.Key, SidewalkZ + TZ[i + 1]),
                                         SidewalkColor);
                                 AddQuad(OutSidewalkData,
-                                        RoadVertex(Inner0.Key, RoadZ + TZ[i], RoadZ),
-                                        RoadVertex(Inner0.Key, CurbZ + TZ[i], CurbZ),
-                                        RoadVertex(Inner1.Key, CurbZ + TZ[i + 1], CurbZ),
-                                        RoadVertex(Inner1.Key, RoadZ + TZ[i + 1], RoadZ),
+                                        RoadVertex(Inner0.Key, RoadZ + TZ[i]),
+                                        RoadVertex(Inner0.Key, CurbZ + TZ[i]),
+                                        RoadVertex(Inner1.Key, CurbZ + TZ[i + 1]),
+                                        RoadVertex(Inner1.Key, RoadZ + TZ[i + 1]),
                                         SidewalkColor);
                         }
                         if (bSWRight)
@@ -5018,16 +4974,16 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                                 const auto Outer0 = OffsetAt(Pts[i], Nrm, OH_R);
                                 const auto Outer1 = OffsetAt(Pts[i + 1], Nrm, OH_R);
                                 AddQuad(OutSidewalkData,
-                                        RoadVertex(Outer0.Value, SidewalkZ + TZ[i], SidewalkZ),
-                                        RoadVertex(Inner0.Value, SidewalkZ + TZ[i], SidewalkZ),
-                                        RoadVertex(Inner1.Value, SidewalkZ + TZ[i + 1], SidewalkZ),
-                                        RoadVertex(Outer1.Value, SidewalkZ + TZ[i + 1], SidewalkZ),
+                                        RoadVertex(Outer0.Value, SidewalkZ + TZ[i]),
+                                        RoadVertex(Inner0.Value, SidewalkZ + TZ[i]),
+                                        RoadVertex(Inner1.Value, SidewalkZ + TZ[i + 1]),
+                                        RoadVertex(Outer1.Value, SidewalkZ + TZ[i + 1]),
                                         SidewalkColor);
                                 AddQuad(OutSidewalkData,
-                                        RoadVertex(Inner0.Value, CurbZ + TZ[i], CurbZ),
-                                        RoadVertex(Inner0.Value, RoadZ + TZ[i], RoadZ),
-                                        RoadVertex(Inner1.Value, RoadZ + TZ[i + 1], RoadZ),
-                                        RoadVertex(Inner1.Value, CurbZ + TZ[i + 1], CurbZ),
+                                        RoadVertex(Inner0.Value, CurbZ + TZ[i]),
+                                        RoadVertex(Inner0.Value, RoadZ + TZ[i]),
+                                        RoadVertex(Inner1.Value, RoadZ + TZ[i + 1]),
+                                        RoadVertex(Inner1.Value, CurbZ + TZ[i + 1]),
                                         SidewalkColor);
                         }
 
@@ -5037,25 +4993,45 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
                                 const FVector2D NPrev = EdgeNormal(Pts[i - 1], Pts[i]);
                                 if (!NPrev.IsNearlyZero() && FVector2D::DotProduct(NPrev, Nrm) < 0.999f)
                                 {
-                                        EmitJoin(OutRoadData, Pts[i], NPrev, Nrm, HW,
-                                                SurfZ + TZ[i], VAlong[i], RoadColor, RoadSlice);
+                                        EmitJoin(Pts[i], NPrev, Nrm, SurfZ + TZ[i], VAlong[i]);
                                 }
                         }
                 }
         }
 
-        // Emit one filled junction polygon per shared meeting point.
-        // A solid unmarked asphalt disk (streets-gl roadwayIntersection) covers
-        // trimmed ribbon ends; the old multi-arm corner fan left striped star
-        // artifacts where lane markings peeked through between arms.
-        for (const auto& Pair : Junctions)
+        // Build the intersection footprint from the actual trimmed ribbon edges.
+        for (auto& Pair : Junctions)
         {
-                const FJunctionInfo& J = Pair.Value;
-                if (J.MaxHW <= 0.f || !NeedsJunctionSurface(J)) continue;
-                // Slightly above ribbons to hide coplanar Z-fight; size covers
-                // the widest meeting road plus trim margin.
-                const float CapR = J.MaxHW * (J.Arms.Num() >= 3 ? 1.45f : 1.3f);
-                AddJunctionCap(OutRoadData, J.Pos, CapR, J.Z + 1.5f, Pair.Key.Z, J.CapColor);
+                auto& Mouths = Pair.Value.Mouths;
+                if (Mouths.Num() < 3) continue;
+                Mouths.Sort([](const FVector& A, const FVector& B)
+                {
+                        return A.X == B.X ? A.Y < B.Y : A.X < B.X;
+                });
+                TArray<FVector> Hull;
+                auto AppendHullPoint = [&](const FVector& Point, int32 ChainStart)
+                {
+                        while (Hull.Num() >= ChainStart + 2)
+                        {
+                                const FVector& A = Hull[Hull.Num() - 2];
+                                const FVector& B = Hull.Last();
+                                if (FVector::CrossProduct(B - A, Point - B).Z > 0.0) break;
+                                Hull.Pop(EAllowShrinking::No);
+                        }
+                        Hull.Add(Point);
+                };
+                for (const FVector& Point : Mouths) AppendHullPoint(Point, 0);
+                const int32 UpperStart = Hull.Num() - 1;
+                for (int32 Index = Mouths.Num() - 2; Index >= 0; --Index)
+                        AppendHullPoint(Mouths[Index], UpperStart);
+                Hull.Pop(EAllowShrinking::No);
+
+                for (int32 Index = 1; Index + 1 < Hull.Num(); ++Index)
+                {
+                        AddTriangle(OutRoadData, Hull[0], Hull[Index], Hull[Index + 1], RoadColor);
+                        for (int32 Corner = 0; Corner < 3; ++Corner)
+                                OutRoadData.UV1.Emplace(1.f, 0.f);
+                }
         }
         // Normals already point up from the CCW winding above; recompute cleanly
         // instead of blindly flipping (the old FlipNormals inverted the ribbon).
@@ -5064,6 +5040,8 @@ void FGeoMeshGenerator::GenerateRoadMeshes(
 
         RecomputeNormals(OutRoadData);
         RecomputeNormals(OutSidewalkData);
+        ProjectOntoGround(OutRoadData);
+        ProjectOntoGround(OutSidewalkData);
 }
 
 // ============================================================================
@@ -5218,6 +5196,115 @@ void FGeoMeshGenerator::GenerateWaterMeshes(
                                 : SampleElevationSamplesMinOffsetUE(*ElevationSamples, WaterRefElev,
                                         ScaleFactor, RPts);
                         ShiftZRange(OutWaterData, StartIdx, ZOff);
+                }
+        }
+
+        if (SampleGroundZ && SampleGroundCells > 0)
+        {
+                for (int32 Index = 0; Index < OutWaterData.Vertices.Num(); ++Index)
+                {
+                        const FVector& Vertex = OutWaterData.Vertices[Index];
+                        OutWaterData.UV0[Index] = FVector2D(Vertex.X / 100.0, Vertex.Y / 100.0);
+                }
+                ProjectOntoGround(OutWaterData);
+        }
+}
+
+void FGeoMeshGenerator::ProjectOntoGround(FMeshData& Mesh, const TBitArray<>* Eligible)
+{
+        if (!SampleGroundZ || SampleGroundCells <= 0 || !SampleGroundBounds.bIsValid)
+                return;
+
+        // Split each surface triangle at terrain edges so its interior follows
+        // the same piecewise planar surface as its vertices.
+        const FVector2D Origin = SampleGroundBounds.Min;
+        const FVector2D Step = SampleGroundBounds.GetSize() / SampleGroundCells;
+        using FClipPolygon = TArray<FVector2D, TInlineAllocator<8>>;
+        auto Clip = [](const FClipPolygon& Input, const FVector2D& A, const FVector2D& B)
+        {
+                FClipPolygon Output;
+                if (Input.IsEmpty()) return Output;
+                FVector2D Previous = Input.Last();
+                double PreviousSide = FVector2D::CrossProduct(B - A, Previous - A);
+                for (const FVector2D& Current : Input)
+                {
+                        const double CurrentSide = FVector2D::CrossProduct(B - A, Current - A);
+                        if ((CurrentSide >= 0.0) != (PreviousSide >= 0.0))
+                                Output.Add(FMath::Lerp(Previous, Current, PreviousSide / (PreviousSide - CurrentSide)));
+                        if (CurrentSide >= 0.0) Output.Add(Current);
+                        Previous = Current;
+                        PreviousSide = CurrentSide;
+                }
+                return Output;
+        };
+        auto Cell = [this](double Offset, double Size)
+        {
+                return FMath::Clamp(FMath::FloorToInt(Offset / Size), 0, SampleGroundCells - 1);
+        };
+        const TArray<int32> Input = MoveTemp(Mesh.Triangles);
+        for (int32 Index = 0; Index + 2 < Input.Num(); Index += 3)
+        {
+                const int32 I0 = Input[Index], I1 = Input[Index + 1], I2 = Input[Index + 2];
+                const FVector A = Mesh.Vertices[I0], B = Mesh.Vertices[I1], C = Mesh.Vertices[I2];
+                const FVector2D P0(A.X, A.Y), P1(B.X, B.Y), P2(C.X, C.Y);
+                const double Area = FVector2D::CrossProduct(P1 - P0, P2 - P0);
+                if ((Eligible && !(*Eligible)[Index / 3]) || FMath::Abs(Area) <= UE_DOUBLE_SMALL_NUMBER)
+                {
+                        Mesh.Triangles.Append({I0, I1, I2});
+                        continue;
+                }
+                const FClipPolygon Triangle{P0, P1, P2};
+                FBox2D Bounds(ForceInit);
+                for (const FVector2D& Point : Triangle) Bounds += Point;
+                const double Z0 = A.Z - SampleGroundZ(P0);
+                const double Z1 = B.Z - SampleGroundZ(P1);
+                const double Z2 = C.Z - SampleGroundZ(P2);
+                const bool bHasUV1 = Mesh.UV1.Num() == Mesh.Vertices.Num();
+                auto AppendVertex = [&](const FVector2D& P)
+                {
+                        const double U = FVector2D::CrossProduct(P - P0, P2 - P0) / Area;
+                        const double V = FVector2D::CrossProduct(P1 - P0, P - P0) / Area;
+                        const double W = 1.0 - U - V;
+                        const FVector2D UV = Mesh.UV0[I0] * W + Mesh.UV0[I1] * U + Mesh.UV0[I2] * V;
+                        const FVector Normal = Mesh.Normals[I0] * W + Mesh.Normals[I1] * U + Mesh.Normals[I2] * V;
+                        const FColor Color = Mesh.VertexColors[I0];
+                        const FProcMeshTangent Tangent = Mesh.Tangents[I0];
+                        if (bHasUV1)
+                        {
+                                const FVector2D UV1 = Mesh.UV1[I0];
+                                Mesh.UV1.Add(UV1);
+                        }
+                        Mesh.Triangles.Add(Mesh.Vertices.Num());
+                        Mesh.Vertices.Emplace(P.X, P.Y, SampleGroundZ(P) + Z0 * W + Z1 * U + Z2 * V);
+                        Mesh.UV0.Add(UV);
+                        Mesh.Normals.Add(Normal.GetSafeNormal());
+                        Mesh.VertexColors.Add(Color);
+                        Mesh.Tangents.Add(Tangent);
+                };
+                for (int32 Y = Cell(Bounds.Min.Y - Origin.Y, Step.Y); Y <= Cell(Bounds.Max.Y - Origin.Y, Step.Y); ++Y)
+                {
+                        for (int32 X = Cell(Bounds.Min.X - Origin.X, Step.X); X <= Cell(Bounds.Max.X - Origin.X, Step.X); ++X)
+                        {
+                                const FVector2D P00 = Origin + FVector2D(X * Step.X, Y * Step.Y);
+                                const FVector2D P10 = P00 + FVector2D(Step.X, 0);
+                                const FVector2D P01 = P00 + FVector2D(0, Step.Y);
+                                const FVector2D P11 = P00 + Step;
+                                const FVector2D Faces[2][3] = {{P00, P10, P11}, {P00, P11, P01}};
+                                for (const auto& Face : Faces)
+                                {
+                                        const FClipPolygon Piece = Clip(Clip(Clip(Triangle, Face[0], Face[1]),
+                                                Face[1], Face[2]), Face[2], Face[0]);
+                                        for (int32 Point = 1; Point + 1 < Piece.Num(); ++Point)
+                                        {
+                                                if (FMath::Abs(FVector2D::CrossProduct(Piece[Point] - Piece[0],
+                                                        Piece[Point + 1] - Piece[0])) <= UE_DOUBLE_SMALL_NUMBER)
+                                                        continue;
+                                                AppendVertex(Piece[0]);
+                                                AppendVertex(Piece[Point]);
+                                                AppendVertex(Piece[Point + 1]);
+                                        }
+                                }
+                        }
                 }
         }
 }
@@ -5449,7 +5536,7 @@ void FGeoMeshGenerator::GenerateRailwayMeshes(
                 // but perfectly flat ground). All zero when no DEM/samples are set.
                 TArray<float> TZ;
                 TZ.SetNumZeroed(N);
-                if (bDeform)
+                if (bDeform && !SampleGroundZ)
                 {
                         for (int32 i = 0; i < N; i++)
                         {
@@ -5485,7 +5572,11 @@ void FGeoMeshGenerator::GenerateRailwayMeshes(
                         Miter[i] = m;
                 }
 
-                TArray<FVector> BallastL, BallastR, RailCL, RailCR;
+                auto RailVertex = [&](const FVector2D& Point, float Height)
+                {
+                        return FVector(Point, SampleGroundZ ? SampleGroundZ(Point) + 5.0 + Height : Height);
+                };
+                TArray<FVector> BallastL, BallastR;
                 BallastL.SetNum(N); BallastR.SetNum(N);
                 TArray<FVector> RailL_L, RailR_L, RailL_R, RailR_R;
                 RailL_L.SetNum(N); RailR_L.SetNum(N); RailL_R.SetNum(N); RailR_R.SetNum(N);
@@ -5493,16 +5584,16 @@ void FGeoMeshGenerator::GenerateRailwayMeshes(
                 {
                         const FVector2D P = Pts[i];
                         const FVector2D M = Miter[i];
-                        const FVector2D Tan(-M.Y, M.X);
-                        BallastL[i] = FVector(P + M * BallastHalfW, BallastZ + TZ[i]);
-                        BallastR[i] = FVector(P - M * BallastHalfW, BallastZ + TZ[i]);
+                        const FVector2D Across = M.GetSafeNormal();
+                        BallastL[i] = RailVertex(P + M * BallastHalfW, BallastZ + TZ[i]);
+                        BallastR[i] = RailVertex(P - M * BallastHalfW, BallastZ + TZ[i]);
 
-                        const FVector2D CL = P + Tan * (GaugeUE * 0.5f);
-                        const FVector2D CR = P - Tan * (GaugeUE * 0.5f);
-                        RailL_L[i] = FVector(CL + M * RailHalfW, RailZ + TZ[i]);
-                        RailR_L[i] = FVector(CL - M * RailHalfW, RailZ + TZ[i]);
-                        RailL_R[i] = FVector(CR + M * RailHalfW, RailZ + TZ[i]);
-                        RailR_R[i] = FVector(CR - M * RailHalfW, RailZ + TZ[i]);
+                        const FVector2D CL = P + Across * (GaugeUE * 0.5f);
+                        const FVector2D CR = P - Across * (GaugeUE * 0.5f);
+                        RailL_L[i] = RailVertex(CL + M * RailHalfW, RailZ + TZ[i]);
+                        RailR_L[i] = RailVertex(CL - M * RailHalfW, RailZ + TZ[i]);
+                        RailL_R[i] = RailVertex(CR + M * RailHalfW, RailZ + TZ[i]);
+                        RailR_R[i] = RailVertex(CR - M * RailHalfW, RailZ + TZ[i]);
                 }
 
                 for (int32 i = 0; i < N - 1; i++)
@@ -5513,6 +5604,8 @@ void FGeoMeshGenerator::GenerateRailwayMeshes(
                 }
         }
 
+        ProjectOntoGround(OutBallastData);
+        ProjectOntoGround(OutRailData);
         RecomputeNormals(OutBallastData);
         RecomputeNormals(OutRailData);
 }
@@ -5952,13 +6045,14 @@ void FGeoMeshGenerator::GeneratePOIMarkers(
         const int32 Sides = 8;
         const float R = FMath::Max(MarkerRadius, 20.f);
         const float H = FMath::Max(MarkerHeight, 50.f);
-        const float BaseZ = 8.f;
+        const float MarkerOffset = 8.f;
 
         for (const FGeoPOI& POI : POIs)
         {
                 const FColor Col = FGeoPOIHelpers::MarkerColorForPOI(POI).ToFColor(true);
                 const float CX = POI.Location.X * ScaleFactor;
                 const float CY = -POI.Location.Y * ScaleFactor;
+                const double BaseZ = (SampleGroundZ ? SampleGroundZ(FVector2D(CX, CY)) : 0.0) + MarkerOffset;
 
                 const int32 BaseIdx = OutPOIData.Vertices.Num();
                 OutPOIData.Vertices.Add(FVector(CX, CY, BaseZ));
@@ -6105,14 +6199,15 @@ void FGeoMeshGenerator::GenerateVegetationMeshes(
                         || Veg.VegType == TEXT("scree") || Veg.VegType == TEXT("farmland"));
                 FillSliceUV1(OutVegetationData, VStart, bBareGround ? 2.f : 3.f);
 
-                if (bHaveDem || bHaveSamples)
+                if (SampleGroundZ || bHaveDem || bHaveSamples)
                 {
                         for (int32 Index = VStart; Index < OutVegetationData.Vertices.Num(); ++Index)
                         {
                                 FVector& Vertex = OutVegetationData.Vertices[Index];
                                 const double LocalX = Vertex.X / ScaleFactor;
                                 const double LocalY = -Vertex.Y / ScaleFactor;
-                                Vertex.Z += bHaveDem
+                                Vertex.Z += SampleGroundZ ? SampleGroundZ(FVector2D(Vertex.X, Vertex.Y))
+                                        : bHaveDem
                                         ? SampleDemOffsetUE(DemHeightmap, OriginLatitude, OriginLongitude,
                                                 VegRefElev, ScaleFactor, LocalX, LocalY)
                                         : SampleElevationSamplesOffsetUE(*ElevationSamples, VegRefElev,
@@ -6121,6 +6216,7 @@ void FGeoMeshGenerator::GenerateVegetationMeshes(
                 }
         }
         RecomputeNormals(OutVegetationData);
+        ProjectOntoGround(OutVegetationData);
 }
 
 // ============================================================================

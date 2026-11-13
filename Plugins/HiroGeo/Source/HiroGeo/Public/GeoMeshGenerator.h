@@ -64,6 +64,8 @@ public:
         // ---------- Settings ----------
         float ScaleFactor; // meters -> UE units (default 100.0 = m->cm)
         TFunction<double(const FVector2D&)> SampleGroundZ;
+        FBox2D SampleGroundBounds = FBox2D(ForceInit);
+        int32 SampleGroundCells = 0;
 
         // ---------- Constructor ----------
         FGeoMeshGenerator() : ScaleFactor(100.0f) {}
@@ -245,6 +247,7 @@ public:
                 const TArray<FElevationSample>* ElevationSamples = nullptr);
 
 private:
+        void ProjectOntoGround(FMeshData& Mesh, const TBitArray<>* Eligible = nullptr);
         // ---------- Primitive helpers ----------
         static void AddQuad(
                 FMeshData& MeshData,

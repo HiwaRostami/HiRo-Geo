@@ -48,6 +48,7 @@ public:
         double GetCenterLongitude() const { return CenterLongitude; }
 
 private:
+        friend class FHiroGeoRustOsmAdapter;
         // --- Parsing phases ---
         void Reset();
         void ParseNodes(const class FXmlNode* RootNode);

@@ -18,7 +18,7 @@ struct FGeoVegetation;
 struct FGeoTree;
 struct FGeoRailway;
 struct FGeoFence;
-struct FGeoPowerLine;
+struct FGeoPowerLine; struct FGeoPOI;
 struct FHiroGeoHeightmap;
 class FHiroGeoElevationFetcher;
 
@@ -36,6 +36,8 @@ public:
         // ====================================================================
         UFUNCTION(CallInEditor, Category = "HiroGeo", meta = (DisplayPriority = "0"))
         void Generate();
+
+        void GenerateAsync(TFunction<void()> OnPlaced, TFunction<void(bool)> Completion);
 
 #if WITH_DEV_AUTOMATION_TESTS
         /** Injects a deterministic DEM completion for actor-level automation.
@@ -389,6 +391,9 @@ protected:
         virtual void PostActorCreated() override;
 
 private:
+        void GenerateInternal(TFunction<void(bool)> Completion, TFunction<void()> OnPlaced = {});
+        void GenerateLoaded(struct FHiroGeoLoadedData Data, uint32 ThisGenerationId, TFunction<void(bool)> Completion, TFunction<void()> OnPlaced = {});
+
         void UpdateDistanceLOD();
         // ---- Internal material references (loaded in constructor or LoadDefaultAssets) ----
         UMaterialInterface* BuildingWallMaterial;
@@ -443,8 +448,7 @@ private:
          *  (already shifted by -OX/-OY). Optional DEM elevates each instance
          *  onto terrain the same way trees/roads are. */
         void SpawnModels(const TArray<FGeoModelInstance>& Models,
-                const FHiroGeoHeightmap* DemHeightmap = nullptr,
-                double OriginLatitude = 0.0, double OriginLongitude = 0.0);
+                const TFunction<double(const FVector2D&)>& SampleGroundZ = {});
         void RemoveModels();
 
         /** Dynamically created instanced components for placed models (one per type). */
@@ -484,8 +488,9 @@ private:
                 const TArray<FGeoFence>& Fences,
                 const TArray<FGeoPowerLine>& PowerLines,
                 const TArray<FGeoModelInstance>& Models,
+                const TArray<FGeoPOI>& POIs,
                 TSharedPtr<FHiroGeoHeightmap> Heightmap,
                 double OriginLatitude,
                 double OriginLongitude,
-                uint32 ForGenerationId);
+                uint32 ForGenerationId, TFunction<void(bool)> Completion);
 };

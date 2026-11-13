@@ -7,6 +7,7 @@
 #include "GeoJSONLoader.h"
 #include "HiroGeoElevationFetcher.h"
 #include "HiroGeoGenerationGate.h"
+#include "Async/Async.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -14,6 +15,13 @@
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Engine/Texture.h"
 #include "EngineUtils.h"
+#if WITH_EDITOR && WITH_DEV_AUTOMATION_TESTS
+#include "HiroGeoRustOsmAdapter.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/CommandLine.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Parse.h"
+#endif
 
 
 // ============================================================================
@@ -32,7 +40,7 @@ AHiroGeoActor::AHiroGeoActor()
         bUseTerrainElevation = true;
         TerrainGridSubdivisions = 48;
         bShowRailways      = true;
-        bShowPOIMarkers    = true;
+        bShowPOIMarkers    = false;
         bUsePBRMaterials   = true;
         bUseElevationDiskCache = true;
         bEnableDistanceLOD = true;
@@ -583,18 +591,10 @@ void AHiroGeoActor::RemoveModels()
 
 void AHiroGeoActor::SpawnModels(
         const TArray<FGeoModelInstance>& Models,
-        const FHiroGeoHeightmap* DemHeightmap,
-        double OriginLatitude, double OriginLongitude)
+        const TFunction<double(const FVector2D&)>& SampleGroundZ)
 {
         RemoveModels();
         if (Models.Num() == 0) return;
-
-        const bool bHaveDem = DemHeightmap && DemHeightmap->IsValid();
-        const double RefElev = bHaveDem
-                ? DemHeightmap->SampleAtLatLon(OriginLatitude, OriginLongitude)
-                : 0.0;
-        const double EarthRadiusM = 6371000.0;
-        const double CosOriginLat = FMath::Cos(OriginLatitude * UE_PI / 180.0);
 
         // One instanced component per model type (cached while iterating).
         TMap<FString, UInstancedStaticMeshComponent*> ByType;
@@ -635,13 +635,7 @@ void AHiroGeoActor::SpawnModels(
                 const float WX = M.Location.X * ScaleFactor;
                 const float WY = -M.Location.Y * ScaleFactor;
 
-                float WZ = GroundOffset;
-                if (bHaveDem)
-                {
-                        const double Lat = OriginLatitude + ((double)M.Location.Y / EarthRadiusM) * 180.0 / UE_PI;
-                        const double Lon = OriginLongitude + ((double)M.Location.X / (EarthRadiusM * FMath::Max(CosOriginLat, 0.0001))) * 180.0 / UE_PI;
-                        WZ = GroundOffset + (float)((DemHeightmap->SampleAtLatLon(Lat, Lon) - RefElev) * ScaleFactor);
-                }
+                const double GroundZ = SampleGroundZ ? SampleGroundZ(FVector2D(WX, WY)) : GroundOffset - 5.0;
 
                 float Yaw;
                 if (M.RotationDeg >= 0.f)
@@ -671,9 +665,14 @@ void AHiroGeoActor::SpawnModels(
                 const FQuat ExtraYawQ(FVector::UpVector, FMath::DegreesToRadians(ExtraYawDeg));
 
                 const FQuat YawQ(FVector::UpVector, FMath::DegreesToRadians(Yaw));
+                const FQuat Rotation = YawQ * ExtraYawQ * BaseQ;
+                const FBoxSphereBounds Bounds = ISM->GetStaticMesh()->GetBounds();
+                const FVector UpInMesh = Rotation.UnrotateVector(FVector::UpVector);
+                const double Bottom = (FVector::DotProduct(Bounds.Origin, UpInMesh)
+                        - FVector::DotProduct(Bounds.BoxExtent, UpInMesh.GetAbs())) * ModelScale;
                 const FTransform Xf(
-                        YawQ * ExtraYawQ * BaseQ,
-                        FVector(WX, WY, WZ),
+                        Rotation,
+                        FVector(WX, WY, GroundZ - Bottom),
                         FVector(ModelScale));
                 ISM->AddInstance(Xf);
                 ++Placed;
@@ -686,24 +685,8 @@ void AHiroGeoActor::SpawnModels(
 // ============================================================================
 // Generate
 // ============================================================================
-void AHiroGeoActor::Generate()
+struct FHiroGeoLoadedData
 {
-        LoadDefaultAssets();
-        Clear();
-
-        // Invalidate any elevation fetch still in flight from a previous Generate()
-        // call so its completion callback can't clobber this run's ground mesh.
-        const uint32 ThisGenerationId = ++CurrentGenerationId;
-#if WITH_DEV_AUTOMATION_TESTS
-        PendingAutomationElevation = nullptr;
-#endif
-        if (ElevationFetcher.IsValid())
-        {
-                ElevationFetcher->Cancel();
-        }
-        ElevationFetcher.Reset();
-
-        // ---------- Load geodata ----------
         TArray<FGeoBuilding>   Buildings;
         TArray<FGeoRoad>       Roads;
         TArray<FGeoWater>      WaterBodies;
@@ -715,21 +698,39 @@ void AHiroGeoActor::Generate()
         TArray<FGeoPowerLine> PowerLines;
         TArray<FGeoTree> Trees;
         TArray<FElevationSample> ElevationSamples;
-
-        // Captured from FOSMLoader before it goes out of scope below — needed both
-        // to drive the online elevation fetch and to translate the local-meter grid
-        // back to lat/lon for DEM sampling. Only populated for the OSM path.
         bool bHaveOsmBounds = false;
         double OsmMinLat = 0.0, OsmMaxLat = 0.0, OsmMinLon = 0.0, OsmMaxLon = 0.0;
         double OsmCenterLat = 0.0, OsmCenterLon = 0.0;
+};
 
+static bool LoadHiroGeoData(bool bUseGeoJSON, const FString& GeoJSONFilePath,
+        const FString& OSMFilePath, FHiroGeoLoadedData& Data)
+{
+        auto& Buildings = Data.Buildings;
+        auto& Roads = Data.Roads;
+        auto& WaterBodies = Data.WaterBodies;
+        auto& POIs = Data.POIs;
+        auto& Vegetations = Data.Vegetations;
+        auto& ModelInstances = Data.ModelInstances;
+        auto& Railways = Data.Railways;
+        auto& Fences = Data.Fences;
+        auto& PowerLines = Data.PowerLines;
+        auto& Trees = Data.Trees;
+        auto& ElevationSamples = Data.ElevationSamples;
+        auto& bHaveOsmBounds = Data.bHaveOsmBounds;
+        auto& OsmMinLat = Data.OsmMinLat;
+        auto& OsmMaxLat = Data.OsmMaxLat;
+        auto& OsmMinLon = Data.OsmMinLon;
+        auto& OsmMaxLon = Data.OsmMaxLon;
+        auto& OsmCenterLat = Data.OsmCenterLat;
+        auto& OsmCenterLon = Data.OsmCenterLon;
         if (bUseGeoJSON && !GeoJSONFilePath.IsEmpty())
         {
                 FGeoJSONLoader Loader;
                 if (!Loader.LoadGeoJSON(GeoJSONFilePath))
                 {
                         UE_LOG(LogTemp, Error, TEXT("HiroGeo: Failed to load GeoJSON: %s"), *GeoJSONFilePath);
-                        return;
+                        return false;
                 }
                 Buildings       = Loader.GetBuildings();
                 Roads           = Loader.GetRoads();
@@ -760,7 +761,7 @@ void AHiroGeoActor::Generate()
                 if (!Loader.LoadOSMFile(OSMFilePath))
                 {
                         UE_LOG(LogTemp, Error, TEXT("HiroGeo: Failed to load OSM: %s"), *OSMFilePath);
-                        return;
+                        return false;
                 }
                 Buildings       = Loader.GetBuildings();
                 Roads           = Loader.GetRoads();
@@ -774,6 +775,49 @@ void AHiroGeoActor::Generate()
                 Trees           = Loader.GetTrees();
                 ElevationSamples= Loader.GetElevationSamples();
 
+#if WITH_EDITOR && WITH_DEV_AUTOMATION_TESTS
+                FString RustPreviewDll;
+                if (!FParse::Param(FCommandLine::Get(), TEXT("HiroGeoUseCpp")))
+                {
+                        if (!FParse::Value(FCommandLine::Get(), TEXT("HiroGeoRustPreviewDll="), RustPreviewDll))
+                        {
+                                if (const auto Plugin = IPluginManager::Get().FindPlugin(TEXT("HiroGeo")))
+                                {
+                                        RustPreviewDll = Plugin->GetBaseDir() /
+                                                TEXT("Source/HiRoGeoRust/target/x86_64-pc-windows-msvc/release/hirogeo_osm.dll");
+                                }
+                        }
+                        TArray<uint8> Source;
+                        FString Error;
+                        if (RustPreviewDll.IsEmpty() || !FPaths::FileExists(RustPreviewDll))
+                        {
+                                Error = TEXT("Rust OSM DLL is unavailable.");
+                        }
+                        else if (FFileHelper::LoadFileToArray(Source, *OSMFilePath))
+                        {
+                                const auto Preview = FHiroGeoRustOsmAdapter::LoadXml(RustPreviewDll, Source, Loader, Error);
+                                if (Preview)
+                                {
+                                        Buildings = Preview->GetBuildings();
+                                        Roads = Preview->GetRoads();
+                                        WaterBodies.RemoveAll([](const FGeoWater& Water) { return Water.bIsClosed; });
+                                        WaterBodies.Append(Preview->GetWaters());
+                                        UE_LOG(LogTemp, Display,
+                                                TEXT("HiroGeo: Rust OSM active | Buildings=%d Roads=%d Waters=%d"),
+                                                Buildings.Num(), Roads.Num(), WaterBodies.Num());
+                                }
+                        }
+                        else
+                        {
+                                Error = TEXT("Cannot read the OSM file for Rust preview.");
+                        }
+                        if (!Error.IsEmpty())
+                        {
+                                UE_LOG(LogTemp, Warning, TEXT("HiroGeo: Rust OSM unavailable; using C++ data. %s"), *Error);
+                        }
+                }
+#endif
+
                 bHaveOsmBounds = true;
                 OsmMinLat = Loader.GetMinLat();
                 OsmMaxLat = Loader.GetMaxLat();
@@ -785,9 +829,90 @@ void AHiroGeoActor::Generate()
         else
         {
                 UE_LOG(LogTemp, Warning, TEXT("HiroGeo: No data file specified"));
+                return false;
+        }
+
+        return true;
+}
+
+void AHiroGeoActor::Generate()
+{
+        GenerateInternal({});
+}
+
+void AHiroGeoActor::GenerateAsync(TFunction<void()> OnPlaced, TFunction<void(bool)> Completion)
+{
+        check(Completion);
+        GenerateInternal(MoveTemp(Completion), MoveTemp(OnPlaced));
+}
+
+void AHiroGeoActor::GenerateInternal(TFunction<void(bool)> Completion, TFunction<void()> OnPlaced)
+{
+        LoadDefaultAssets();
+        Clear();
+
+        // Invalidate any elevation fetch still in flight from a previous Generate()
+        // call so its completion callback can't clobber this run's ground mesh.
+        const uint32 ThisGenerationId = ++CurrentGenerationId;
+#if WITH_DEV_AUTOMATION_TESTS
+        PendingAutomationElevation = nullptr;
+#endif
+        if (ElevationFetcher.IsValid())
+        {
+                ElevationFetcher->Cancel();
+        }
+        ElevationFetcher.Reset();
+
+        if (!Completion)
+        {
+                FHiroGeoLoadedData Data;
+                if (LoadHiroGeoData(bUseGeoJSON, GeoJSONFilePath, OSMFilePath, Data))
+                        GenerateLoaded(MoveTemp(Data), ThisGenerationId, {});
                 return;
         }
 
+        Async(EAsyncExecution::ThreadPool,
+                [WeakActor = TWeakObjectPtr<AHiroGeoActor>(this), ThisGenerationId,
+                 bGeoJSON = bUseGeoJSON, GeoPath = GeoJSONFilePath, OsmPath = OSMFilePath,
+                 Completion = MoveTemp(Completion), OnPlaced = MoveTemp(OnPlaced)]() mutable
+        {
+                FHiroGeoLoadedData Data;
+                const bool bLoaded = LoadHiroGeoData(bGeoJSON, GeoPath, OsmPath, Data);
+                AsyncTask(ENamedThreads::GameThread,
+                        [WeakActor, ThisGenerationId, bLoaded, Data = MoveTemp(Data),
+                         Completion = MoveTemp(Completion), OnPlaced = MoveTemp(OnPlaced)]() mutable
+                {
+                        AHiroGeoActor* Actor = WeakActor.Get();
+                        if (!bLoaded || !Actor || Actor->CurrentGenerationId != ThisGenerationId)
+                        {
+                                Completion(false);
+                                return;
+                        }
+                        Actor->GenerateLoaded(MoveTemp(Data), ThisGenerationId, MoveTemp(Completion), MoveTemp(OnPlaced));
+                });
+        });
+}
+
+void AHiroGeoActor::GenerateLoaded(FHiroGeoLoadedData Data, uint32 ThisGenerationId, TFunction<void(bool)> Completion, TFunction<void()> OnPlaced)
+{
+        auto& Buildings = Data.Buildings;
+        auto& Roads = Data.Roads;
+        auto& WaterBodies = Data.WaterBodies;
+        auto& POIs = Data.POIs;
+        auto& Vegetations = Data.Vegetations;
+        auto& ModelInstances = Data.ModelInstances;
+        auto& Railways = Data.Railways;
+        auto& Fences = Data.Fences;
+        auto& PowerLines = Data.PowerLines;
+        auto& Trees = Data.Trees;
+        auto& ElevationSamples = Data.ElevationSamples;
+        auto& bHaveOsmBounds = Data.bHaveOsmBounds;
+        auto& OsmMinLat = Data.OsmMinLat;
+        auto& OsmMaxLat = Data.OsmMaxLat;
+        auto& OsmMinLon = Data.OsmMinLon;
+        auto& OsmMaxLon = Data.OsmMaxLon;
+        auto& OsmCenterLat = Data.OsmCenterLat;
+        auto& OsmCenterLon = Data.OsmCenterLon;
         // ---------- نکته ۲: فیلتر داده‌ها به اندازه Grid ----------
 
         // Raw (uncentered, no-margin) ground-rect bounds for the selected grid
@@ -1318,49 +1443,170 @@ void AHiroGeoActor::Generate()
         for (FGeoModelInstance& M : ModelInstances) { M.Location.X -= OX; M.Location.Y -= OY; }
         for (FElevationSample& E : ElevationSamples) { E.Location.X -= OX; E.Location.Y -= OY; }
 
-        // ---------- Generate meshes ----------
-        FGeoMeshGenerator MeshGen;
-        MeshGen.ScaleFactor = ScaleFactor;
-
-        // Buildings
-        // Per-building terrain offset from the sparse OSM "ele"/GeoJSON-Z elevation
-        // samples — mirrors what RebuildMeshesWithHeightmap does with a real DEM, so
-        // buildings sit on the same terrain the ground mesh below them is deformed
-        // to instead of floating on/sinking into it (no online DEM is available yet
-        // at this point in Generate(), hence DemHeightmap=nullptr here).
-        TArray<float> BuildingZOffsets = FGeoMeshGenerator::ComputeBuildingTerrainOffsets(
-                Buildings, ScaleFactor, /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
-
-        FGeoMeshGenerator::FMeshData WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData;
-        FGeoMeshGenerator::FMeshData WindowFrameData, WindowGlassData;
-        MeshGen.GenerateBuildingMeshes(Buildings, WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData,
-                WindowFrameData, WindowGlassData, &BuildingZOffsets);
-
-        static const TArray<FVector2D> EmptyUV;
-        static const TArray<FVector> EmptyV3;
-        static const TArray<FColor> EmptyCol;
-        static const TArray<FProcMeshTangent> EmptyTang;
-
-        auto CreateSection = [&](UProceduralMeshComponent* Comp, int32 Sec,
-                                  FGeoMeshGenerator::FMeshData& D, bool bCollision)
+        struct FPreparedMeshes
         {
-                // ALWAYS create the section — even with zero vertices — so that
-                // section indices remain contiguous (PMC requires 0..N-1 with no
-                // gaps).  Empty sections are invisible and cost nothing.
-                if (D.Vertices.Num() > 0)
+                FGeoMeshGenerator::FMeshData BallastData, BrickData, ColorWallData, DarkData, FenceData, GlassData, GroundData, LightData, POIData, PitchData, RailStripData, RoadData, RoofColorData, RoofData, SWData, VegData, WallData, WaterData, WindowData, WindowFrameData, WindowGlassData, WireData;
+                TArray<FTransform> TreeXf, GrassXf;
+        };
+
+        auto Prepare = [ScaleFactor = ScaleFactor, GroundOffset = GroundOffset,
+                TerrainGridSubdivisions = TerrainGridSubdivisions, bHasGridGroundBounds = bHasGridGroundBounds,
+                GridGroundMinX = GridGroundMinX, GridGroundMaxX = GridGroundMaxX,
+                GridGroundMinY = GridGroundMinY, GridGroundMaxY = GridGroundMaxY,
+                bShowRailways = bShowRailways, bShowPOIMarkers = bShowPOIMarkers,
+                POIMarkerRadius = POIMarkerRadius, POIMarkerHeight = POIMarkerHeight,
+                TreeDensityScale = TreeDensityScale, GrassDensityScale = GrassDensityScale]
+                (FHiroGeoLoadedData& Data)
+        {
+                FPreparedMeshes Meshes;
+                FGeoMeshGenerator MeshGen;
+                auto& BallastData = Meshes.BallastData;
+                auto& BrickData = Meshes.BrickData;
+                auto& ColorWallData = Meshes.ColorWallData;
+                auto& DarkData = Meshes.DarkData;
+                auto& FenceData = Meshes.FenceData;
+                auto& GlassData = Meshes.GlassData;
+                auto& GroundData = Meshes.GroundData;
+                auto& LightData = Meshes.LightData;
+                auto& POIData = Meshes.POIData;
+                auto& PitchData = Meshes.PitchData;
+                auto& RailStripData = Meshes.RailStripData;
+                auto& RoadData = Meshes.RoadData;
+                auto& RoofColorData = Meshes.RoofColorData;
+                auto& RoofData = Meshes.RoofData;
+                auto& SWData = Meshes.SWData;
+                auto& VegData = Meshes.VegData;
+                auto& WallData = Meshes.WallData;
+                auto& WaterData = Meshes.WaterData;
+                auto& WindowData = Meshes.WindowData;
+                auto& WindowFrameData = Meshes.WindowFrameData;
+                auto& WindowGlassData = Meshes.WindowGlassData;
+                auto& WireData = Meshes.WireData;
+                auto& TreeXf = Meshes.TreeXf;
+                auto& GrassXf = Meshes.GrassXf;
+                auto& Buildings = Data.Buildings;
+                auto& Roads = Data.Roads;
+                auto& WaterBodies = Data.WaterBodies;
+                auto& POIs = Data.POIs;
+                auto& Vegetations = Data.Vegetations;
+                auto& ModelInstances = Data.ModelInstances;
+                auto& Railways = Data.Railways;
+                auto& Fences = Data.Fences;
+                auto& PowerLines = Data.PowerLines;
+                auto& Trees = Data.Trees;
+                auto& ElevationSamples = Data.ElevationSamples;
+                MeshGen.ScaleFactor = ScaleFactor;
+                TArray<float> BuildingZOffsets = FGeoMeshGenerator::ComputeBuildingTerrainOffsets(
+                Buildings, ScaleFactor, /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
+                MeshGen.GenerateBuildingMeshes(Buildings, WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData,
+                WindowFrameData, WindowGlassData, &BuildingZOffsets);
+                MeshGen.GenerateRoadMeshes(Roads, RoadData, SWData, nullptr, 0.0, 0.0, &ElevationSamples);
+                MeshGen.GenerateWaterMeshes(WaterBodies, WaterData, nullptr, 0.0, 0.0, nullptr);
+                MeshGen.GenerateGroundMesh(Buildings, Roads, WaterBodies, Vegetations,
+                ElevationSamples, GroundData, GroundOffset, /*bUseTerrainElevation=*/ false, TerrainGridSubdivisions,
+                nullptr, 0.0, 0.0,
+                bHasGridGroundBounds, GridGroundMinX, GridGroundMaxX, GridGroundMinY, GridGroundMaxY);
+                if (bShowRailways)
                 {
-                        Comp->CreateMeshSection(Sec,
-                                D.Vertices, D.Triangles, D.Normals,
-                                D.UV0, D.UV1, EmptyUV, EmptyUV,
-                                D.VertexColors, D.Tangents, bCollision);
+                        MeshGen.GenerateRailwayMeshes(Railways, BallastData, RailStripData,
+                                nullptr, 0.0, 0.0, nullptr);
                 }
-                else
+                MeshGen.GenerateFenceMeshes(Fences, FenceData, nullptr, 0.0, 0.0, nullptr);
+                MeshGen.GeneratePowerLineMeshes(PowerLines, WireData, nullptr, 0.0, 0.0, nullptr, &ModelInstances);
+                MeshGen.GeneratePitchMarkings(Vegetations, PitchData, nullptr, 0.0, 0.0, nullptr);
+                if (bShowPOIMarkers)
                 {
-                        Comp->CreateMeshSection(Sec,
-                                EmptyV3, TArray<int32>(), EmptyV3,
-                                EmptyUV, EmptyUV, EmptyUV, EmptyUV,
-                                EmptyCol, EmptyTang, bCollision);
+                        MeshGen.GeneratePOIMarkers(POIs, POIData, POIMarkerRadius, POIMarkerHeight);
                 }
+                MeshGen.GenerateRoofMeshes(Buildings, RoofData, RoofColorData, &BuildingZOffsets);
+                MeshGen.GenerateVegetationMeshes(Vegetations, VegData, nullptr, 0.0, 0.0, nullptr);
+                MeshGen.GenerateVegetationTransforms(Vegetations, Buildings, Roads,
+                TreeXf, GrassXf, TreeDensityScale, GrassDensityScale,
+                /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
+                FGeoMeshGenerator::AppendOSMTreeTransforms(Trees, TreeXf, ScaleFactor, GroundOffset,
+                /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
+                return Meshes;
+        };
+
+        const bool bAsync = !!Completion;
+        auto OnComplete = MakeShared<TFunction<void(bool)>, ESPMode::ThreadSafe>(MoveTemp(Completion));
+        auto Apply = [this, ThisGenerationId, OX, OY, OriginLatitude, OriginLongitude,
+                OnComplete, OnPlaced = MoveTemp(OnPlaced)](FHiroGeoLoadedData Data, FPreparedMeshes Meshes) mutable
+        {
+                auto& BallastData = Meshes.BallastData;
+                auto& BrickData = Meshes.BrickData;
+                auto& ColorWallData = Meshes.ColorWallData;
+                auto& DarkData = Meshes.DarkData;
+                auto& FenceData = Meshes.FenceData;
+                auto& GlassData = Meshes.GlassData;
+                auto& GroundData = Meshes.GroundData;
+                auto& LightData = Meshes.LightData;
+                auto& POIData = Meshes.POIData;
+                auto& PitchData = Meshes.PitchData;
+                auto& RailStripData = Meshes.RailStripData;
+                auto& RoadData = Meshes.RoadData;
+                auto& RoofColorData = Meshes.RoofColorData;
+                auto& RoofData = Meshes.RoofData;
+                auto& SWData = Meshes.SWData;
+                auto& VegData = Meshes.VegData;
+                auto& WallData = Meshes.WallData;
+                auto& WaterData = Meshes.WaterData;
+                auto& WindowData = Meshes.WindowData;
+                auto& WindowFrameData = Meshes.WindowFrameData;
+                auto& WindowGlassData = Meshes.WindowGlassData;
+                auto& WireData = Meshes.WireData;
+                auto& TreeXf = Meshes.TreeXf;
+                auto& GrassXf = Meshes.GrassXf;
+                auto& Buildings = Data.Buildings;
+                auto& Roads = Data.Roads;
+                auto& WaterBodies = Data.WaterBodies;
+                auto& POIs = Data.POIs;
+                auto& Vegetations = Data.Vegetations;
+                auto& ModelInstances = Data.ModelInstances;
+                auto& Railways = Data.Railways;
+                auto& Fences = Data.Fences;
+                auto& PowerLines = Data.PowerLines;
+                auto& Trees = Data.Trees;
+                auto& bHaveOsmBounds = Data.bHaveOsmBounds;
+                auto& OsmMinLat = Data.OsmMinLat;
+                auto& OsmMaxLat = Data.OsmMaxLat;
+                auto& OsmMinLon = Data.OsmMinLon;
+                auto& OsmMaxLon = Data.OsmMaxLon;
+                // ---------- Generate meshes ----------
+
+                // Buildings
+                // Per-building terrain offset from the sparse OSM "ele"/GeoJSON-Z elevation
+                // samples — mirrors what RebuildMeshesWithHeightmap does with a real DEM, so
+                // buildings sit on the same terrain the ground mesh below them is deformed
+                // to instead of floating on/sinking into it (no online DEM is available yet
+                // at this point in Generate(), hence DemHeightmap=nullptr here).
+
+
+                static const TArray<FVector2D> EmptyUV;
+                static const TArray<FVector> EmptyV3;
+                static const TArray<FColor> EmptyCol;
+                static const TArray<FProcMeshTangent> EmptyTang;
+
+                auto CreateSection = [&](UProceduralMeshComponent* Comp, int32 Sec,
+                                          FGeoMeshGenerator::FMeshData& D, bool bCollision)
+                {
+                        // ALWAYS create the section — even with zero vertices — so that
+                        // section indices remain contiguous (PMC requires 0..N-1 with no
+                        // gaps).  Empty sections are invisible and cost nothing.
+                        if (D.Vertices.Num() > 0)
+                        {
+                                Comp->CreateMeshSection(Sec,
+                                        D.Vertices, D.Triangles, D.Normals,
+                                        D.UV0, D.UV1, EmptyUV, EmptyUV,
+                                        D.VertexColors, D.Tangents, bCollision);
+                        }
+                        else
+                        {
+                                Comp->CreateMeshSection(Sec,
+                                        EmptyV3, TArray<int32>(), EmptyV3,
+                                        EmptyUV, EmptyUV, EmptyUV, EmptyUV,
+                                        EmptyCol, EmptyTang, bCollision);
+                        }
         };
 
         // Collision on solid wall sections so characters cannot walk through
@@ -1380,8 +1626,6 @@ void AHiroGeoActor::Generate()
         }
 
         // Roads
-        FGeoMeshGenerator::FMeshData RoadData, SWData;
-        MeshGen.GenerateRoadMeshes(Roads, RoadData, SWData, nullptr, 0.0, 0.0, &ElevationSamples);
         CreateSection(RoadMeshComp,     0, RoadData, true);
         CreateSection(SidewalkMeshComp, 0, SWData,   true);
         if (RoadMeshComp)     RoadMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
@@ -1390,13 +1634,10 @@ void AHiroGeoActor::Generate()
         // Water — در پاس synchronous بدون ElevationSamples صاف می‌ماند
         // (همان دلیل زمین: IDW پراکنده روی centroid دریاچه/رودخانه مقدار غلط می‌دهد
         //  و آب را بالاتر از زمین صاف می‌برد؛ DEM واقعی آن را درست می‌کند)
-        FGeoMeshGenerator::FMeshData WaterData;
-        MeshGen.GenerateWaterMeshes(WaterBodies, WaterData, nullptr, 0.0, 0.0, nullptr);
         CreateSection(WaterMeshComp, 0, WaterData, false);
 
         // Ground (flat or terrain-deformed from ele / GeoJSON Z) — this synchronous
         // pass uses the sparse OSM "ele" tags (if any) and always renders immediately.
-        FGeoMeshGenerator::FMeshData GroundData;
         // زمین در پاس synchronous صاف می‌ماند تا DEM آنلاین برسد.
         // اگر از همین الان bUseTerrainElevation=true داشته باشیم، GenerateGroundMesh
         // سعی می‌کند با ElevationSamples (تگ‌های ele پراکنده) زمین را deform کند —
@@ -1405,10 +1646,6 @@ void AHiroGeoActor::Generate()
         // ساختمان‌ها زیر زمین می‌روند یا جاده‌ها معلق می‌شوند.
         // وقتی DEM واقعی از Esri می‌رسد (RebuildMeshesWithHeightmap)، همه‌ی
         // feature‌ها با هم و از همان RefElev دقیقاً re-elevated می‌شوند.
-        MeshGen.GenerateGroundMesh(Buildings, Roads, WaterBodies, Vegetations,
-                ElevationSamples, GroundData, GroundOffset, /*bUseTerrainElevation=*/ false, TerrainGridSubdivisions,
-                nullptr, 0.0, 0.0,
-                bHasGridGroundBounds, GridGroundMinX, GridGroundMaxX, GridGroundMinY, GridGroundMaxY);
         CreateSection(GroundMeshComp, 0, GroundData, true);
         if (GroundMeshComp) GroundMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
 
@@ -1419,7 +1656,8 @@ void AHiroGeoActor::Generate()
 
         // If enabled, kick off an elevation fetch and rebuild the affected
         // meshes once it arrives — see RebuildMeshesWithHeightmap().
-        if (bFetchOnlineElevation && bUseTerrainElevation && bHaveOsmBounds)
+        const bool bFetchElevation = bFetchOnlineElevation && bUseTerrainElevation && bHaveOsmBounds;
+        if (bFetchElevation)
         {
                 TWeakObjectPtr<AHiroGeoActor> WeakThis(this);
                 TArray<FGeoBuilding> CapturedBuildings = Buildings;
@@ -1431,6 +1669,7 @@ void AHiroGeoActor::Generate()
                 TArray<FGeoFence> CapturedFences = Fences;
                 TArray<FGeoPowerLine> CapturedPowerLines = PowerLines;
                 TArray<FGeoModelInstance> CapturedModels = ModelInstances;
+                TArray<FGeoPOI> CapturedPOIs = POIs;
 
                 double FetchMinLat = OsmMinLat, FetchMinLon = OsmMinLon;
                 double FetchMaxLat = OsmMaxLat, FetchMaxLon = OsmMaxLon;
@@ -1446,25 +1685,27 @@ void AHiroGeoActor::Generate()
                 FHiroGeoElevationFetcher::FOnComplete ElevationComplete =
                         FHiroGeoElevationFetcher::FOnComplete::CreateLambda(
                                 [WeakThis, CapturedBuildings, CapturedRoads, CapturedWaterBodies, CapturedVegetations,
-                                 CapturedTrees, CapturedRailways, CapturedFences, CapturedPowerLines, CapturedModels,
-                                 OriginLatitude, OriginLongitude, ThisGenerationId, ElevationGate]
+                                 CapturedTrees, CapturedRailways, CapturedFences, CapturedPowerLines, CapturedModels, CapturedPOIs,
+                                 OriginLatitude, OriginLongitude, ThisGenerationId, ElevationGate, OnComplete]
                                 (bool bSuccess, TSharedPtr<FHiroGeoHeightmap> Heightmap)
                                 {
                                         ElevationGate->Submit(
                                         [WeakThis, CapturedBuildings, CapturedRoads, CapturedWaterBodies, CapturedVegetations,
-                                         CapturedTrees, CapturedRailways, CapturedFences, CapturedPowerLines, CapturedModels,
-                                         OriginLatitude, OriginLongitude, ThisGenerationId, bSuccess, Heightmap]
+                                         CapturedTrees, CapturedRailways, CapturedFences, CapturedPowerLines, CapturedModels, CapturedPOIs,
+                                         OriginLatitude, OriginLongitude, ThisGenerationId, bSuccess, Heightmap, OnComplete]
                                         ()
                                         {
-                                                if (AHiroGeoActor* Actor = WeakThis.Get())
+                                                if (AHiroGeoActor* Actor = WeakThis.Get(); Actor && Actor->CurrentGenerationId == ThisGenerationId)
                                                 {
                                                         if (bSuccess && Heightmap.IsValid())
                                                         {
+                                                                Actor->ElevationFetcher.Reset();
                                                                 Actor->RebuildMeshesWithHeightmap(
                                                                         CapturedBuildings, CapturedRoads, CapturedWaterBodies, CapturedVegetations,
                                                                         CapturedTrees, CapturedRailways, CapturedFences, CapturedPowerLines,
-                                                                        CapturedModels, Heightmap,
-                                                                        OriginLatitude, OriginLongitude, ThisGenerationId);
+                                                                        CapturedModels, CapturedPOIs, Heightmap,
+                                                                        OriginLatitude, OriginLongitude, ThisGenerationId, *OnComplete);
+                                                                return;
                                                         }
                                                         else
                                                         {
@@ -1478,6 +1719,7 @@ void AHiroGeoActor::Generate()
                                                         }
                                                         Actor->ElevationFetcher.Reset();
                                                 }
+                                                if (*OnComplete) (*OnComplete)(WeakThis.IsValid() && WeakThis->CurrentGenerationId == ThisGenerationId);
                                         });
                                 });
 
@@ -1514,19 +1756,12 @@ void AHiroGeoActor::Generate()
         // Railways — در پاس synchronous هم صاف (بدون ElevationSamples)
         if (bShowRailways)
         {
-                FGeoMeshGenerator::FMeshData BallastData, RailStripData;
-                MeshGen.GenerateRailwayMeshes(Railways, BallastData, RailStripData,
-                        nullptr, 0.0, 0.0, nullptr);
                 CreateSection(RailwayMeshComp, 0, BallastData, false);
                 CreateSection(RailwayMeshComp, 1, RailStripData, false);
         }
 
         // Fences / walls / hedges + power-line wires + pitch markings
         {
-                FGeoMeshGenerator::FMeshData FenceData, WireData, PitchData;
-                MeshGen.GenerateFenceMeshes(Fences, FenceData, nullptr, 0.0, 0.0, nullptr);
-                MeshGen.GeneratePowerLineMeshes(PowerLines, WireData, nullptr, 0.0, 0.0, nullptr, &ModelInstances);
-                MeshGen.GeneratePitchMarkings(Vegetations, PitchData, nullptr, 0.0, 0.0, nullptr);
                 CreateSection(FenceMeshComp, 0, FenceData, true);  // fences/walls/hedges
                 CreateSection(FenceMeshComp, 1, WireData, false);  // powerline wires (thin)
                 CreateSection(FenceMeshComp, 2, PitchData, false); // pitch markings (flat decals)
@@ -1534,25 +1769,19 @@ void AHiroGeoActor::Generate()
         }
 
         // POI markers
-        FGeoMeshGenerator::FMeshData POIData;
         if (bShowPOIMarkers)
         {
-                MeshGen.GeneratePOIMarkers(POIs, POIData, POIMarkerRadius, POIMarkerHeight);
                 CreateSection(POIMeshComp, 0, POIData, false);
         }
 
         // Roofs  ← flat roofs (atlas) in section 0, shaped/landmark roofs (OSM colour) in section 1
         // Same BuildingZOffsets array/order as the walls above, so roofs stay flush
         // on top of their own building instead of detaching from it.
-        FGeoMeshGenerator::FMeshData RoofData, RoofColorData;
-        MeshGen.GenerateRoofMeshes(Buildings, RoofData, RoofColorData, &BuildingZOffsets);
         CreateSection(RoofMeshComp, 0, RoofData,      true);
         CreateSection(RoofMeshComp, 1, RoofColorData, true);
         if (RoofMeshComp) RoofMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
 
         // Vegetation
-        FGeoMeshGenerator::FMeshData VegData;
-        MeshGen.GenerateVegetationMeshes(Vegetations, VegData, nullptr, 0.0, 0.0, nullptr);
         CreateSection(VegetationMeshComp, 0, VegData, false);
 
         // ---------- Materials ----------
@@ -1565,12 +1794,6 @@ void AHiroGeoActor::Generate()
         UpdateB(VegetationMeshComp); UpdateB(RailwayMeshComp); UpdateB(FenceMeshComp); UpdateB(POIMeshComp);
 
         // ---------- Vegetation instances ----------
-        TArray<FTransform> TreeXf, GrassXf;
-        MeshGen.GenerateVegetationTransforms(Vegetations, Buildings, Roads,
-                TreeXf, GrassXf, TreeDensityScale, GrassDensityScale,
-                /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
-        FGeoMeshGenerator::AppendOSMTreeTransforms(Trees, TreeXf, ScaleFactor, GroundOffset,
-                /*DemHeightmap*/ nullptr, 0.0, 0.0, &ElevationSamples);
         SpawnVegetation(TreeXf, GrassXf);
 
         // ---------- OSM 3D models (hydrants, benches, towers, statues, …) ----------
@@ -1607,7 +1830,33 @@ void AHiroGeoActor::Generate()
 
         // Flush an inline cache completion only after every non-DEM section and
         // instance has been created. Async completion passes straight through.
+        if (OnPlaced) OnPlaced();
         ElevationGate->Open();
+        if (!bFetchElevation && *OnComplete) (*OnComplete)(true);
+        };
+
+        if (!bAsync)
+        {
+                FPreparedMeshes Meshes = Prepare(Data);
+                Apply(MoveTemp(Data), MoveTemp(Meshes));
+                return;
+        }
+
+        Async(EAsyncExecution::ThreadPool,
+                [Prepare = MoveTemp(Prepare), Apply = MoveTemp(Apply), Data = MoveTemp(Data),
+                 WeakActor = TWeakObjectPtr<AHiroGeoActor>(this), ThisGenerationId, OnComplete]() mutable
+        {
+                FPreparedMeshes Meshes = Prepare(Data);
+                AsyncTask(ENamedThreads::GameThread,
+                        [WeakActor, ThisGenerationId, OnComplete, Apply = MoveTemp(Apply),
+                         Data = MoveTemp(Data), Meshes = MoveTemp(Meshes)]() mutable
+                {
+                        if (AHiroGeoActor* Actor = WeakActor.Get(); Actor && Actor->CurrentGenerationId == ThisGenerationId)
+                                Apply(MoveTemp(Data), MoveTemp(Meshes));
+                        else
+                                (*OnComplete)(false);
+                });
+        });
 }
 
 // ============================================================================
@@ -1622,6 +1871,40 @@ void AHiroGeoActor::Generate()
 // reusing the locals from Generate(), which has already returned by the time
 // this runs.
 // ============================================================================
+static void SetGroundSampler(FGeoMeshGenerator& MeshGen, const FGeoMeshGenerator::FMeshData& GroundData,
+        int32 TerrainGridSubdivisions, bool bUseTerrainElevation)
+{
+        const int32 GroundCells = FMath::Clamp(TerrainGridSubdivisions, 8, 256);
+        const int32 GroundStride = GroundCells + 1;
+        if (bUseTerrainElevation && GroundData.Vertices.Num() == GroundStride * GroundStride)
+        {
+                const FVector Min = GroundData.Vertices[0];
+                const FVector Max = GroundData.Vertices.Last();
+                if (Max.X > Min.X && Max.Y > Min.Y)
+                {
+                        MeshGen.SampleGroundBounds = FBox2D(FVector2D(Min.X, Min.Y), FVector2D(Max.X, Max.Y));
+                        MeshGen.SampleGroundCells = GroundCells;
+                        MeshGen.SampleGroundZ = [&GroundData, Min, Max, GroundCells, GroundStride](const FVector2D& Point)
+                        {
+                                const double X = FMath::Clamp((Point.X - Min.X) / (Max.X - Min.X), 0.0, 1.0) * GroundCells;
+                                const double Y = FMath::Clamp((Point.Y - Min.Y) / (Max.Y - Min.Y), 0.0, 1.0) * GroundCells;
+                                const int32 Column = FMath::Min(FMath::FloorToInt(X), GroundCells - 1);
+                                const int32 Row = FMath::Min(FMath::FloorToInt(Y), GroundCells - 1);
+                                const int32 Corner = Row * GroundStride + Column;
+                                const double U = X - Column;
+                                const double V = Y - Row;
+                                const double Z00 = GroundData.Vertices[Corner].Z;
+                                const double Z11 = GroundData.Vertices[Corner + GroundStride + 1].Z;
+
+                                // Match the two triangles emitted by GenerateGroundMesh.
+                                if (U >= V)
+                                        return (1.0 - U) * Z00 + (U - V) * GroundData.Vertices[Corner + 1].Z + V * Z11;
+                                return (1.0 - V) * Z00 + (V - U) * GroundData.Vertices[Corner + GroundStride].Z + U * Z11;
+                        };
+                }
+        }
+}
+
 void AHiroGeoActor::RebuildMeshesWithHeightmap(
         const TArray<FGeoBuilding>& Buildings,
         const TArray<FGeoRoad>& Roads,
@@ -1632,10 +1915,11 @@ void AHiroGeoActor::RebuildMeshesWithHeightmap(
         const TArray<FGeoFence>& Fences,
         const TArray<FGeoPowerLine>& PowerLines,
         const TArray<FGeoModelInstance>& Models,
+        const TArray<FGeoPOI>& POIs,
         TSharedPtr<FHiroGeoHeightmap> Heightmap,
         double OriginLatitude,
         double OriginLongitude,
-        uint32 ForGenerationId)
+        uint32 ForGenerationId, TFunction<void(bool)> Completion)
 {
         // A newer Generate() call superseded the one that started this fetch —
         // discard the result rather than overwrite the current meshes.
@@ -1654,8 +1938,6 @@ void AHiroGeoActor::RebuildMeshesWithHeightmap(
                 SampleOriginLon = MeshOriginLongitude;
         }
 
-        FGeoMeshGenerator MeshGen;
-        MeshGen.ScaleFactor = ScaleFactor;
         const FHiroGeoHeightmap* Dem = Heightmap.Get();
 
         // ---------------------------------------------------------------------
@@ -1769,83 +2051,78 @@ void AHiroGeoActor::RebuildMeshesWithHeightmap(
             }
         }
 
-        auto LogZRange = [this](const TCHAR* Label, const FGeoMeshGenerator::FMeshData& D)
+        struct FPreparedTerrain
         {
-                if (D.Vertices.Num() == 0)
-                {
-                        UE_LOG(LogTemp, Log, TEXT("HiroGeo[ZDiag] %-12s: (no vertices)"), Label);
-                        return;
-                }
-                float MinZ = D.Vertices[0].Z, MaxZ = D.Vertices[0].Z;
-                for (const FVector& V : D.Vertices) { MinZ = FMath::Min(MinZ, V.Z); MaxZ = FMath::Max(MaxZ, V.Z); }
-                UE_LOG(LogTemp, Log, TEXT("HiroGeo[ZDiag] %-12s: Z [%.1f .. %.1f] UE  (%.2fm .. %.2fm)"),
-                        Label, MinZ, MaxZ, MinZ / ScaleFactor, MaxZ / ScaleFactor);
+                FGeoMeshGenerator::FMeshData BallastData, BrickData, ColorWallData, DarkData, FenceData, GlassData, GroundData, LightData, POIData, PitchData, RailStripData, RoadData, RoofColorData, RoofData, SWData, VegData, WallData, WaterData, WindowData, WindowFrameData, WindowGlassData, WireData;
+                TArray<FTransform> TreeXf, GrassXf;
         };
-
-        static const TArray<FVector2D> EmptyUV;
-        static const TArray<FVector> EmptyV3;
-        static const TArray<FColor> EmptyCol;
-        static const TArray<FProcMeshTangent> EmptyTang;
-
-        auto CreateSection = [&](UProceduralMeshComponent* Comp, int32 Sec,
-                                  FGeoMeshGenerator::FMeshData& D, bool bCollision)
+        FHiroGeoLoadedData Input;
+        Input.Buildings = Buildings;
+        Input.Roads = Roads;
+        Input.WaterBodies = WaterBodies;
+        Input.Vegetations = Vegetations;
+        Input.Trees = Trees;
+        Input.Railways = Railways;
+        Input.Fences = Fences;
+        Input.PowerLines = PowerLines;
+        Input.POIs = POIs;
+        Input.ModelInstances = Models;
+        auto Prepare = [ScaleFactor = ScaleFactor, GroundOffset = GroundOffset,
+                TerrainGridSubdivisions = TerrainGridSubdivisions, bHasGridGroundBounds = bHasGridGroundBounds,
+                GridGroundMinX = GridGroundMinX, GridGroundMaxX = GridGroundMaxX,
+                GridGroundMinY = GridGroundMinY, GridGroundMaxY = GridGroundMaxY,
+                bUseTerrainElevation = bUseTerrainElevation, bShowRailways = bShowRailways,
+                bShowPOIMarkers = bShowPOIMarkers, POIMarkerRadius = POIMarkerRadius,
+                POIMarkerHeight = POIMarkerHeight, TreeDensityScale = TreeDensityScale,
+                GrassDensityScale = GrassDensityScale, SampleOriginLat, SampleOriginLon, Heightmap]
+                (FHiroGeoLoadedData& Data)
         {
-                if (!Comp) return;
-                if (D.Vertices.Num() > 0)
-                {
-                        Comp->CreateMeshSection(Sec,
-                                D.Vertices, D.Triangles, D.Normals,
-                                D.UV0, D.UV1, EmptyUV, EmptyUV,
-                                D.VertexColors, D.Tangents, bCollision);
-                }
-                else
-                {
-                        Comp->CreateMeshSection(Sec,
-                                EmptyV3, TArray<int32>(), EmptyV3,
-                                EmptyUV, EmptyUV, EmptyUV, EmptyUV,
-                                EmptyCol, EmptyTang, bCollision);
-                }
-        };
-
+                FPreparedTerrain Meshes;
+                FGeoMeshGenerator MeshGen;
+                MeshGen.ScaleFactor = ScaleFactor;
+                const FHiroGeoHeightmap* Dem = Heightmap.Get();
+                auto& BallastData = Meshes.BallastData;
+                auto& BrickData = Meshes.BrickData;
+                auto& ColorWallData = Meshes.ColorWallData;
+                auto& DarkData = Meshes.DarkData;
+                auto& FenceData = Meshes.FenceData;
+                auto& GlassData = Meshes.GlassData;
+                auto& GroundData = Meshes.GroundData;
+                auto& LightData = Meshes.LightData;
+                auto& POIData = Meshes.POIData;
+                auto& PitchData = Meshes.PitchData;
+                auto& RailStripData = Meshes.RailStripData;
+                auto& RoadData = Meshes.RoadData;
+                auto& RoofColorData = Meshes.RoofColorData;
+                auto& RoofData = Meshes.RoofData;
+                auto& SWData = Meshes.SWData;
+                auto& VegData = Meshes.VegData;
+                auto& WallData = Meshes.WallData;
+                auto& WaterData = Meshes.WaterData;
+                auto& WindowData = Meshes.WindowData;
+                auto& WindowFrameData = Meshes.WindowFrameData;
+                auto& WindowGlassData = Meshes.WindowGlassData;
+                auto& WireData = Meshes.WireData;
+                auto& TreeXf = Meshes.TreeXf;
+                auto& GrassXf = Meshes.GrassXf;
+                auto& Buildings = Data.Buildings;
+                auto& Roads = Data.Roads;
+                auto& WaterBodies = Data.WaterBodies;
+                auto& Vegetations = Data.Vegetations;
+                auto& Trees = Data.Trees;
+                auto& Railways = Data.Railways;
+                auto& Fences = Data.Fences;
+                auto& PowerLines = Data.PowerLines;
+                auto& POIs = Data.POIs;
         // GenerateGroundMesh doesn't use OSM "ele" tags when a DEM is supplied (see
         // GeoMeshGenerator.cpp), so an empty array here is fine.
         static const TArray<FElevationSample> EmptyElevationSamples;
-        FGeoMeshGenerator::FMeshData GroundData;
         MeshGen.GenerateGroundMesh(Buildings, Roads, WaterBodies, Vegetations,
                 EmptyElevationSamples, GroundData, GroundOffset, bUseTerrainElevation, TerrainGridSubdivisions,
                 Dem, SampleOriginLat, SampleOriginLon,
                 bHasGridGroundBounds, GridGroundMinX, GridGroundMaxX, GridGroundMinY, GridGroundMaxY);
-        LogZRange(TEXT("GroundData"), GroundData);
-        CreateSection(GroundMeshComp, 0, GroundData, true);
-        if (GroundMeshComp) GroundMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
 
-        const int32 GroundCells = FMath::Clamp(TerrainGridSubdivisions, 8, 256);
-        const int32 GroundStride = GroundCells + 1;
-        if (bUseTerrainElevation && GroundData.Vertices.Num() == GroundStride * GroundStride)
-        {
-                const FVector Min = GroundData.Vertices[0];
-                const FVector Max = GroundData.Vertices.Last();
-                if (Max.X > Min.X && Max.Y > Min.Y)
-                {
-                        MeshGen.SampleGroundZ = [&GroundData, Min, Max, GroundCells, GroundStride](const FVector2D& Point)
-                        {
-                                const double X = FMath::Clamp((Point.X - Min.X) / (Max.X - Min.X), 0.0, 1.0) * GroundCells;
-                                const double Y = FMath::Clamp((Point.Y - Min.Y) / (Max.Y - Min.Y), 0.0, 1.0) * GroundCells;
-                                const int32 Column = FMath::Min(FMath::FloorToInt(X), GroundCells - 1);
-                                const int32 Row = FMath::Min(FMath::FloorToInt(Y), GroundCells - 1);
-                                const int32 Corner = Row * GroundStride + Column;
-                                const double U = X - Column;
-                                const double V = Y - Row;
-                                const double Z00 = GroundData.Vertices[Corner].Z;
-                                const double Z11 = GroundData.Vertices[Corner + GroundStride + 1].Z;
-
-                                // Match the two triangles emitted by GenerateGroundMesh.
-                                if (U >= V)
-                                        return (1.0 - U) * Z00 + (U - V) * GroundData.Vertices[Corner + 1].Z + V * Z11;
-                                return (1.0 - V) * Z00 + (V - U) * GroundData.Vertices[Corner + GroundStride].Z + U * Z11;
-                        };
-                }
-        }
+        SetGroundSampler(MeshGen, GroundData, TerrainGridSubdivisions, bUseTerrainElevation);
 
         // Per-building terrain offset (one entry per Buildings element), shared
         // by walls and roofs so a building's roof never detaches from its walls.
@@ -1894,12 +2171,145 @@ void AHiroGeoActor::RebuildMeshesWithHeightmap(
         }
 
         // Buildings (walls/windows/glass) — same 9 sections as Generate().
-        FGeoMeshGenerator::FMeshData WallData, GlassData, BrickData, DarkData, LightData, ColorWallData, WindowData;
-        FGeoMeshGenerator::FMeshData WindowFrameData, WindowGlassData;
         MeshGen.GenerateBuildingMeshes(Buildings, WallData, GlassData, BrickData, DarkData, LightData, ColorWallData,
                 WindowData, WindowFrameData, WindowGlassData, &BuildingZOffsets, &BuildingFoundationDepths);
-        LogZRange(TEXT("WallData"), WallData);
         // Same collision flags as Generate() — solid walls/facades on, thin panes off.
+
+        // Roofs — same BuildingZOffsets array/order keeps them flush on the walls.
+        MeshGen.GenerateRoofMeshes(Buildings, RoofData, RoofColorData, &BuildingZOffsets);
+
+        // Roads + sidewalks — sampled per polyline vertex so they follow slopes.
+        MeshGen.GenerateRoadMeshes(Roads, RoadData, SWData, Dem, SampleOriginLat, SampleOriginLon);
+
+        // Water — one flat offset per body, sampled at its footprint centroid.
+        MeshGen.GenerateWaterMeshes(WaterBodies, WaterData, Dem, SampleOriginLat, SampleOriginLon);
+        // Railways — ballast bed + rails, one offset per polyline vertex so the
+        // track follows rising/falling terrain just like roads (previously this
+        // step was never re-run here, so railways stayed perfectly flat at their
+        // initial Z forever, floating over hills/sinking into dips on anything
+        // but flat ground).
+        if (bShowRailways)
+        {
+                MeshGen.GenerateRailwayMeshes(Railways, BallastData, RailStripData,
+                        Dem, SampleOriginLat, SampleOriginLon);
+        }
+
+        // Mutable copy so powerline socket pass can orient poles (RotationDeg).
+        auto& MutableModels = Data.ModelInstances;
+
+        
+        {
+                MeshGen.GenerateFenceMeshes(Fences, FenceData, Dem, SampleOriginLat, SampleOriginLon);
+                MeshGen.GeneratePowerLineMeshes(PowerLines, WireData, Dem, SampleOriginLat, SampleOriginLon, nullptr, &MutableModels);
+                MeshGen.GeneratePitchMarkings(Vegetations, PitchData, Dem, SampleOriginLat, SampleOriginLon);
+        }
+
+        // Vegetation ground-cover areas — one flat offset per patch.
+        if (bShowPOIMarkers)
+        {
+                MeshGen.GeneratePOIMarkers(POIs, POIData, POIMarkerRadius, POIMarkerHeight);
+        }
+        MeshGen.GenerateVegetationMeshes(Vegetations, VegData, Dem, SampleOriginLat, SampleOriginLon);
+        // Scattered trees/grass + individually-tagged OSM trees — one offset per
+        // instance, so vegetation follows the same terrain as everything else
+        // instead of staying frozen on the flat plane it was scattered on before
+        // the online DEM arrived.
+        MeshGen.GenerateVegetationTransforms(Vegetations, Buildings, Roads,
+                TreeXf, GrassXf, TreeDensityScale, GrassDensityScale,
+                Dem, SampleOriginLat, SampleOriginLon);
+        FGeoMeshGenerator::AppendOSMTreeTransforms(Trees, TreeXf, ScaleFactor, GroundOffset,
+                Dem, SampleOriginLat, SampleOriginLon);
+        if (MeshGen.SampleGroundZ)
+        {
+                for (TArray<FTransform>* Instances : {&TreeXf, &GrassXf})
+                {
+                        for (FTransform& Instance : *Instances)
+                        {
+                                FVector Position = Instance.GetLocation();
+                                Position.Z = MeshGen.SampleGroundZ(FVector2D(Position.X, Position.Y)) + 5.0;
+                                Instance.SetLocation(Position);
+                        }
+                }
+        }
+        // Re-place street furniture / landmarks on the DEM so they don't float
+        // at Z=0 after terrain rebuild (previously only trees were re-elevated).
+
+                return Meshes;
+        };
+
+        const bool bAsync = !!Completion;
+        auto OnComplete = MakeShared<TFunction<void(bool)>, ESPMode::ThreadSafe>(MoveTemp(Completion));
+        auto Apply = [this, Heightmap, OnComplete](FHiroGeoLoadedData Data, FPreparedTerrain Meshes)
+        {
+                        auto& BallastData = Meshes.BallastData;
+                        auto& BrickData = Meshes.BrickData;
+                        auto& ColorWallData = Meshes.ColorWallData;
+                        auto& DarkData = Meshes.DarkData;
+                        auto& FenceData = Meshes.FenceData;
+                        auto& GlassData = Meshes.GlassData;
+                        auto& GroundData = Meshes.GroundData;
+                        auto& LightData = Meshes.LightData;
+                        auto& POIData = Meshes.POIData;
+                        auto& PitchData = Meshes.PitchData;
+                        auto& RailStripData = Meshes.RailStripData;
+                        auto& RoadData = Meshes.RoadData;
+                        auto& RoofColorData = Meshes.RoofColorData;
+                        auto& RoofData = Meshes.RoofData;
+                        auto& SWData = Meshes.SWData;
+                        auto& VegData = Meshes.VegData;
+                        auto& WallData = Meshes.WallData;
+                        auto& WaterData = Meshes.WaterData;
+                        auto& WindowData = Meshes.WindowData;
+                        auto& WindowFrameData = Meshes.WindowFrameData;
+                        auto& WindowGlassData = Meshes.WindowGlassData;
+                        auto& WireData = Meshes.WireData;
+                        auto& TreeXf = Meshes.TreeXf;
+                        auto& GrassXf = Meshes.GrassXf;
+                auto LogZRange = [this](const TCHAR* Label, const FGeoMeshGenerator::FMeshData& D)
+                {
+                        if (D.Vertices.Num() == 0)
+                        {
+                                UE_LOG(LogTemp, Log, TEXT("HiroGeo[ZDiag] %-12s: (no vertices)"), Label);
+                                return;
+                        }
+                        float MinZ = D.Vertices[0].Z, MaxZ = D.Vertices[0].Z;
+                        for (const FVector& V : D.Vertices) { MinZ = FMath::Min(MinZ, V.Z); MaxZ = FMath::Max(MaxZ, V.Z); }
+                        UE_LOG(LogTemp, Log, TEXT("HiroGeo[ZDiag] %-12s: Z [%.1f .. %.1f] UE  (%.2fm .. %.2fm)"),
+                                Label, MinZ, MaxZ, MinZ / ScaleFactor, MaxZ / ScaleFactor);
+        };
+
+        static const TArray<FVector2D> EmptyUV;
+        static const TArray<FVector> EmptyV3;
+        static const TArray<FColor> EmptyCol;
+        static const TArray<FProcMeshTangent> EmptyTang;
+
+        auto CreateSection = [&](UProceduralMeshComponent* Comp, int32 Sec,
+                                  FGeoMeshGenerator::FMeshData& D, bool bCollision)
+        {
+                if (!Comp) return;
+                if (D.Vertices.Num() > 0)
+                {
+                        Comp->CreateMeshSection(Sec,
+                                D.Vertices, D.Triangles, D.Normals,
+                                D.UV0, D.UV1, EmptyUV, EmptyUV,
+                                D.VertexColors, D.Tangents, bCollision);
+                }
+                else
+                {
+                        Comp->CreateMeshSection(Sec,
+                                EmptyV3, TArray<int32>(), EmptyV3,
+                                EmptyUV, EmptyUV, EmptyUV, EmptyUV,
+                                EmptyCol, EmptyTang, bCollision);
+                }
+        };
+
+
+        FGeoMeshGenerator MeshGen;
+        SetGroundSampler(MeshGen, GroundData, TerrainGridSubdivisions, bUseTerrainElevation);
+
+        LogZRange(TEXT("GroundData"), GroundData);
+        CreateSection(GroundMeshComp, 0, GroundData, true);
+        LogZRange(TEXT("WallData"), WallData);
         CreateSection(BuildingMeshComp, 0, WallData,        true);
         CreateSection(BuildingMeshComp, 1, GlassData,       true);
         CreateSection(BuildingMeshComp, 2, BrickData,       true);
@@ -1909,95 +2319,59 @@ void AHiroGeoActor::RebuildMeshesWithHeightmap(
         CreateSection(BuildingMeshComp, 6, WindowData,      true);
         CreateSection(BuildingMeshComp, 7, WindowFrameData, false);
         CreateSection(BuildingMeshComp, 8, WindowGlassData, false);
-        if (BuildingMeshComp)
-        {
-                BuildingMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
-        }
-
-        // Roofs — same BuildingZOffsets array/order keeps them flush on the walls.
-        FGeoMeshGenerator::FMeshData RoofData, RoofColorData;
-        MeshGen.GenerateRoofMeshes(Buildings, RoofData, RoofColorData, &BuildingZOffsets);
         CreateSection(RoofMeshComp, 0, RoofData,      true);
         CreateSection(RoofMeshComp, 1, RoofColorData, true);
-        if (RoofMeshComp) RoofMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
-
-        // Roads + sidewalks — sampled per polyline vertex so they follow slopes.
-        FGeoMeshGenerator::FMeshData RoadData, SWData;
-        MeshGen.GenerateRoadMeshes(Roads, RoadData, SWData, Dem, SampleOriginLat, SampleOriginLon);
         LogZRange(TEXT("RoadData"), RoadData);
         LogZRange(TEXT("SWData"), SWData);
         CreateSection(RoadMeshComp,     0, RoadData, true);
         CreateSection(SidewalkMeshComp, 0, SWData,   true);
-        if (RoadMeshComp)     RoadMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
-        if (SidewalkMeshComp) SidewalkMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
-
-        // Water — one flat offset per body, sampled at its footprint centroid.
-        FGeoMeshGenerator::FMeshData WaterData;
-        MeshGen.GenerateWaterMeshes(WaterBodies, WaterData, Dem, SampleOriginLat, SampleOriginLon);
         LogZRange(TEXT("WaterData"), WaterData);
         CreateSection(WaterMeshComp, 0, WaterData, false);
-
-        // Railways — ballast bed + rails, one offset per polyline vertex so the
-        // track follows rising/falling terrain just like roads (previously this
-        // step was never re-run here, so railways stayed perfectly flat at their
-        // initial Z forever, floating over hills/sinking into dips on anything
-        // but flat ground).
-        if (bShowRailways && RailwayMeshComp)
-        {
-                FGeoMeshGenerator::FMeshData BallastData, RailStripData;
-                MeshGen.GenerateRailwayMeshes(Railways, BallastData, RailStripData,
-                        Dem, SampleOriginLat, SampleOriginLon);
-                CreateSection(RailwayMeshComp, 0, BallastData, false);
-                CreateSection(RailwayMeshComp, 1, RailStripData, false);
-        }
-
-        // Mutable copy so powerline socket pass can orient poles (RotationDeg).
-        TArray<FGeoModelInstance> MutableModels = Models;
-
-        if (FenceMeshComp)
-        {
-                FGeoMeshGenerator::FMeshData FenceData, WireData, PitchData;
-                MeshGen.GenerateFenceMeshes(Fences, FenceData, Dem, SampleOriginLat, SampleOriginLon);
-                MeshGen.GeneratePowerLineMeshes(PowerLines, WireData, Dem, SampleOriginLat, SampleOriginLon, nullptr, &MutableModels);
-                MeshGen.GeneratePitchMarkings(Vegetations, PitchData, Dem, SampleOriginLat, SampleOriginLon);
-                CreateSection(FenceMeshComp, 0, FenceData, true);
-                CreateSection(FenceMeshComp, 1, WireData, false);
-                CreateSection(FenceMeshComp, 2, PitchData, false);
-                FenceMeshComp->SetCollisionProfileName(TEXT("BlockAll"));
-        }
-
-        // Vegetation ground-cover areas — one flat offset per patch.
-        FGeoMeshGenerator::FMeshData VegData;
-        MeshGen.GenerateVegetationMeshes(Vegetations, VegData, Dem, SampleOriginLat, SampleOriginLon);
+        CreateSection(RailwayMeshComp, 0, BallastData, false);
+        CreateSection(RailwayMeshComp, 1, RailStripData, false);
+        CreateSection(FenceMeshComp, 0, FenceData, true);
+        CreateSection(FenceMeshComp, 1, WireData, false);
+        CreateSection(FenceMeshComp, 2, PitchData, false);
+        CreateSection(POIMeshComp, 0, POIData, false);
         CreateSection(VegetationMeshComp, 0, VegData, false);
-
-        // Scattered trees/grass + individually-tagged OSM trees — one offset per
-        // instance, so vegetation follows the same terrain as everything else
-        // instead of staying frozen on the flat plane it was scattered on before
-        // the online DEM arrived.
-        TArray<FTransform> TreeXf, GrassXf;
-        MeshGen.GenerateVegetationTransforms(Vegetations, Buildings, Roads,
-                TreeXf, GrassXf, TreeDensityScale, GrassDensityScale,
-                Dem, SampleOriginLat, SampleOriginLon);
-        FGeoMeshGenerator::AppendOSMTreeTransforms(Trees, TreeXf, ScaleFactor, GroundOffset,
-                Dem, SampleOriginLat, SampleOriginLon);
         SpawnVegetation(TreeXf, GrassXf);
-
-        // Re-place street furniture / landmarks on the DEM so they don't float
-        // at Z=0 after terrain rebuild (previously only trees were re-elevated).
-        SpawnModels(MutableModels, Dem, SampleOriginLat, SampleOriginLon);
-
-        // CreateMeshSection replaces geometry and clears per-section materials —
-        // re-bind them or the rebuilt city renders unlit/default grey.
+        SpawnModels(Data.ModelInstances, MeshGen.SampleGroundZ);
+        for (UProceduralMeshComponent* Component : {GroundMeshComp, BuildingMeshComp,
+                RoofMeshComp, RoadMeshComp, SidewalkMeshComp, FenceMeshComp})
+        {
+                if (Component) Component->SetCollisionProfileName(TEXT("BlockAll"));
+        }
         ApplyMaterials();
-
-        auto UpdateB = [](UProceduralMeshComponent* C) { if (C) C->UpdateBounds(); };
-        UpdateB(BuildingMeshComp); UpdateB(RoofMeshComp); UpdateB(RoadMeshComp);
-        UpdateB(SidewalkMeshComp); UpdateB(WaterMeshComp); UpdateB(VegetationMeshComp);
-        UpdateB(GroundMeshComp); UpdateB(RailwayMeshComp); UpdateB(FenceMeshComp);
-
+        for (UProceduralMeshComponent* Component : {GroundMeshComp, BuildingMeshComp, RoofMeshComp,
+                RoadMeshComp, SidewalkMeshComp, WaterMeshComp, VegetationMeshComp, RailwayMeshComp, FenceMeshComp})
+        {
+                if (Component) Component->UpdateBounds();
+        }
         UE_LOG(LogTemp, Log, TEXT("HiroGeo: meshes rebuilt with online elevation data (%dx%d px @ zoom %d)."),
                 Heightmap->Width, Heightmap->Height, Heightmap->Zoom);
+        if (*OnComplete) (*OnComplete)(true);
+        };
+        if (!bAsync)
+        {
+                FPreparedTerrain Meshes = Prepare(Input);
+                Apply(MoveTemp(Input), MoveTemp(Meshes));
+                return;
+        }
+        Async(EAsyncExecution::ThreadPool,
+                [Prepare = MoveTemp(Prepare), Apply = MoveTemp(Apply), Data = MoveTemp(Input),
+                 WeakActor = TWeakObjectPtr<AHiroGeoActor>(this), ForGenerationId, OnComplete]() mutable
+        {
+                FPreparedTerrain Meshes = Prepare(Data);
+                AsyncTask(ENamedThreads::GameThread,
+                        [WeakActor, ForGenerationId, OnComplete, Apply = MoveTemp(Apply),
+                         Data = MoveTemp(Data), Meshes = MoveTemp(Meshes)]() mutable
+                {
+                        if (AHiroGeoActor* Actor = WeakActor.Get(); Actor && Actor->CurrentGenerationId == ForGenerationId)
+                                Apply(MoveTemp(Data), MoveTemp(Meshes));
+                        else
+                                (*OnComplete)(false);
+                });
+        });
 }
 
 // ============================================================================

@@ -1059,6 +1059,13 @@ void FOSMLoader::ProcessRailwayWay(const FXmlNode* WayNode)
 
         TMap<FString, FString> Tags = ExtractTags(WayNode);
 
+        const FString Tunnel = Tags.FindRef(TEXT("tunnel")).ToLower();
+        if ((!Tunnel.IsEmpty() && Tunnel != TEXT("no")) ||
+                Tags.FindRef(TEXT("location")).Equals(TEXT("underground"), ESearchCase::IgnoreCase) ||
+                FCString::Atof(*Tags.FindRef(TEXT("level"))) < 0.f ||
+                FCString::Atoi(*Tags.FindRef(TEXT("layer"))) < 0)
+                return;
+
         TArray<int64> NodeRefs;
         for (const FXmlNode* NdChild : WayNode->GetChildrenNodes())
         {
@@ -1417,25 +1424,26 @@ void FOSMLoader::ApplyRoadTags(FGeoRoad& Road, const TMap<FString, FString>& Tag
                 Road.RoadTypeStr = Tags[TEXT("highway")];
                 FString HW = Road.RoadTypeStr.ToLower();
 
-                if (HW == TEXT("motorway"))            Road.Width = 24.0f;
-                else if (HW == TEXT("motorway_link"))   Road.Width = 12.0f;
-                else if (HW == TEXT("trunk"))           Road.Width = 20.0f;
-                else if (HW == TEXT("trunk_link"))      Road.Width = 12.0f;
-                else if (HW == TEXT("primary"))         Road.Width = 14.0f;
-                else if (HW == TEXT("primary_link"))    Road.Width = 10.0f;
-                else if (HW == TEXT("secondary"))       Road.Width = 12.0f;
-                else if (HW == TEXT("secondary_link"))  Road.Width = 10.0f;
-                else if (HW == TEXT("tertiary"))        Road.Width = 10.0f;
-                else if (HW == TEXT("residential"))     Road.Width = 8.0f;
-                else if (HW == TEXT("service"))         Road.Width = 5.0f;
-                else if (HW == TEXT("living_street"))   Road.Width = 6.0f;
-                else if (HW == TEXT("pedestrian"))      Road.Width = 6.0f;
-                else if (HW == TEXT("footway"))         Road.Width = 2.0f;
-                else if (HW == TEXT("path"))            Road.Width = 1.5f;
-                else if (HW == TEXT("cycleway"))        Road.Width = 2.0f;
-                else if (HW == TEXT("steps"))           Road.Width = 2.0f;
-                else if (HW == TEXT("track"))           Road.Width = 3.0f;
-                else                                    Road.Width = 8.0f;
+                if (HW == TEXT("cycleway"))
+                        Road.Width = 3.f;
+                else if (HW == TEXT("footway") || HW == TEXT("path") || HW == TEXT("steps") ||
+                         HW == TEXT("pedestrian") || HW == TEXT("bridleway") || HW == TEXT("corridor"))
+                        Road.Width = 2.f;
+                else if (HW == TEXT("raceway"))
+                        Road.Width = 6.f;
+                else
+                {
+                        const int32 DefaultLanes = HW.EndsWith(TEXT("_link")) || HW == TEXT("track") ||
+                                HW == TEXT("busway") ? 1 : 2;
+                        int32 Lanes = FCString::Atoi(*Tags.FindRef(TEXT("lanes")));
+                        if (Lanes <= 0)
+                        {
+                                Lanes = FMath::Clamp(FCString::Atoi(*Tags.FindRef(TEXT("lanes:forward"))), 0, 32) +
+                                        FMath::Clamp(FCString::Atoi(*Tags.FindRef(TEXT("lanes:backward"))), 0, 32);
+                        }
+                        Lanes = Lanes > 0 ? FMath::Min(Lanes, 32) : DefaultLanes;
+                        Road.Width = Lanes == 1 ? 4.f : 3.f * Lanes;
+                }
 
                 Road.bIsHighway = (HW == TEXT("motorway") || HW == TEXT("trunk") ||
                         HW == TEXT("primary") || HW == TEXT("secondary") || HW == TEXT("tertiary") ||

@@ -33,6 +33,8 @@
 #include "Misc/FileHelper.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "Widgets/Notifications/SNotificationList.h"
+#include "Widgets/Notifications/SProgressBar.h"
+#include "Widgets/SOverlay.h"
 
 #define LOCTEXT_NAMESPACE "HiroGeoImporter"
 
@@ -187,7 +189,13 @@ TSharedRef<SWidget> SHiroGeoImporterWindow::BuildSettingsPanel()
         .Visibility(this, &SHiroGeoImporterWindow::GetLocalFileButtonVisibility)
         [
             SNew(SButton)
-            .Text(LOCTEXT("SelectOSM", "Select .OSM File"))
+            .Text_Lambda([this]()
+            {
+                return SelectedLocalOsmPath.IsEmpty() ? LOCTEXT("SelectOSM", "Select .OSM File")
+                    : FText::FromString(FPaths::GetCleanFilename(SelectedLocalOsmPath));
+            })
+            .ToolTipText_Lambda([this]() { return FText::FromString(SelectedLocalOsmPath); })
+            .IsEnabled_Lambda([this]() { return !IsImportBusy(); })
             .HAlign(HAlign_Center)
             .OnClicked(FOnClicked::CreateSP(this, &SHiroGeoImporterWindow::OnSelectFileClicked))
         ]
@@ -305,11 +313,31 @@ TSharedRef<SWidget> SHiroGeoImporterWindow::BuildSettingsPanel()
     // ---- دکمه Generate Map در وسط پایین ستون تنظیمات ----
     + SVerticalBox::Slot().AutoHeight().Padding(0, 0, 0, 10).HAlign(HAlign_Center)
     [
-        SNew(SButton)
-        .Text(LOCTEXT("Generate", "Generate Map"))
-        .HAlign(HAlign_Center)
-        .IsEnabled_Lambda([this]() { return !DownloadRequest.IsValid() && !RetryTickerHandle.IsValid(); })
-        .OnClicked(this, &SHiroGeoImporterWindow::OnGenerateClicked)
+        SNew(SBox).MinDesiredWidth(132.f).MinDesiredHeight(22.f)
+        [
+            SNew(SOverlay)
+            + SOverlay::Slot()
+            [
+                SNew(SButton)
+                .Text_Lambda([this]() { return IsImportBusy() ? FText::GetEmpty() : LOCTEXT("Generate", "Generate Map"); })
+                .HAlign(HAlign_Center)
+                .IsEnabled_Lambda([this]() { return !IsImportBusy(); })
+                .OnClicked(this, &SHiroGeoImporterWindow::OnGenerateClicked)
+            ]
+            + SOverlay::Slot()
+            [
+                SNew(SProgressBar)
+                .Percent(TOptional<float>())
+                .FillColorAndOpacity(FLinearColor(0.06f, 0.35f, 0.95f, 0.85f))
+                .Visibility_Lambda([this]() { return IsImportBusy() ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+            ]
+            + SOverlay::Slot().HAlign(HAlign_Center).VAlign(VAlign_Center)
+            [
+                SNew(STextBlock)
+                .Text_Lambda([this]() { return bBuildQueued ? LOCTEXT("BuildingMap", "Building map…") : LOCTEXT("DownloadingMap", "Downloading…"); })
+                .Visibility_Lambda([this]() { return IsImportBusy() ? EVisibility::HitTestInvisible : EVisibility::Collapsed; })
+            ]
+        ]
     ];
 }
 
@@ -496,6 +524,33 @@ FString SHiroGeoImporterWindow::GetMapHTML() const
         <div id="map"></div>
         <script>
             var map = L.map('map').setView([35.6892, 51.3890], 13);
+
+            var initialLocationPending = true;
+            function keepCurrentLocation() { initialLocationPending = false; }
+            map.on('movestart click', keepCurrentLocation);
+            var locationController = new AbortController();
+            var locationTimeout = setTimeout(function() { locationController.abort(); }, 4000);
+            fetch('https://get.geojs.io/v1/ip/geo.json', {
+                signal: locationController.signal, credentials: 'omit', referrerPolicy: 'no-referrer'
+            }).then(function(response) {
+                if (!response.ok) return null;
+                return response.json();
+            }).then(function(location) {
+                if (!location || !initialLocationPending ||
+                    typeof location.latitude !== 'string' || !location.latitude.trim() ||
+                    typeof location.longitude !== 'string' || !location.longitude.trim()) return;
+                var latitude = Number(location.latitude);
+                var longitude = Number(location.longitude);
+                if (Number.isFinite(latitude) && Math.abs(latitude) <= 85.051129 &&
+                    Number.isFinite(longitude) && Math.abs(longitude) <= 180) {
+                    map.setView([latitude, longitude], 13, {animate: false});
+                }
+            }).catch(function() {
+                // Keep the fallback view when the lookup is unavailable.
+            }).finally(function() {
+                clearTimeout(locationTimeout);
+                map.off('movestart click', keepCurrentLocation);
+            });
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 attribution: '&copy; OpenStreetMap contributors'
             }).addTo(map);
@@ -626,6 +681,7 @@ FString SHiroGeoImporterWindow::GetMapHTML() const
                 redrawGrid();
             };
             window.HiroGeoSearchLocation = function(query) {
+                keepCurrentLocation();
                 var coordMatch = query.match(/^(-?\d+\.?\d*)\s*[,\s]\s*(-?\d+\.?\d*)$/);
                 if (coordMatch) {
                     var lat = parseFloat(coordMatch[1]);
@@ -663,6 +719,7 @@ FString SHiroGeoImporterWindow::GetMapHTML() const
 // ================================================================
 void SHiroGeoImporterWindow::OnMapBoundsReceived(FString MinLat, FString MinLon, FString MaxLat, FString MaxLon, FString CellKey)
 {
+    if (IsImportBusy()) return;
     // ---- نکته ۱: بررسی اینکه آیا این سلول گرید قبلاً ساخته شده ----
     if (!CellKey.IsEmpty() && IsGridCellAlreadyGenerated(CellKey))
     {
@@ -825,7 +882,7 @@ void SHiroGeoImporterWindow::DownloadOSMData(FString MinLat, FString MinLon, FSt
                 Cached.Contains(TEXT("<osm")) && Cached.Contains(TEXT("</osm>")))
             {
                 SetDownloadStatus(FString::Printf(TEXT("OSM cache hit — loading %s"), *CacheName), true);
-                SpawnHiroGeoActorAndBuild(CachePath, PendingMinLat, PendingMinLon, PendingMaxLat, PendingMaxLon);
+                QueueMapBuild(CachePath, PendingMinLat, PendingMinLon, PendingMaxLat, PendingMaxLon);
                 return;
             }
         }
@@ -987,7 +1044,7 @@ void SHiroGeoImporterWindow::OnDownloadComplete(FHttpRequestPtr Request, FHttpRe
             FFileHelper::SaveStringToFile(Content, *PendingOSMCachePath);
             PendingOSMCachePath.Reset();
         }
-        SpawnHiroGeoActorAndBuild(FilePath, PendingMinLat, PendingMinLon, PendingMaxLat, PendingMaxLon);
+        QueueMapBuild(FilePath, PendingMinLat, PendingMinLon, PendingMaxLat, PendingMaxLon);
     }
     else
     {
@@ -997,10 +1054,20 @@ void SHiroGeoImporterWindow::OnDownloadComplete(FHttpRequestPtr Request, FHttpRe
 
 FReply SHiroGeoImporterWindow::OnGenerateClicked()
 {
+    if (IsImportBusy()) return FReply::Handled();
     if (bIsLocalMode)
     {
         // در حالت Local، کلیک Generate همان کار Select File رو می‌کنه
-        return OnSelectFileClicked();
+        if (!SelectedLocalOsmPath.IsEmpty())
+        {
+            PendingCellKey.Reset();
+            QueueMapBuild(SelectedLocalOsmPath);
+        }
+        else
+        {
+            FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("SelectOsmFirst", "Select a local .OSM file first."));
+        }
+        return FReply::Handled();
     }
 
     if (WebBrowser.IsValid())
@@ -1012,15 +1079,32 @@ FReply SHiroGeoImporterWindow::OnGenerateClicked()
 
 FReply SHiroGeoImporterWindow::OnSelectFileClicked()
 {
+    if (IsImportBusy()) return FReply::Handled();
     TArray<FString> OutFiles;
     if (FDesktopPlatformModule::Get()->OpenFileDialog(nullptr, TEXT("Select OSM File"), TEXT(""), TEXT(""), TEXT("OSM File|*.osm"), EFileDialogFlags::None, OutFiles))
     {
         if (OutFiles.Num() > 0)
         {
-            SpawnHiroGeoActorAndBuild(OutFiles[0]);
+            SelectedLocalOsmPath = MoveTemp(OutFiles[0]);
         }
     }
     return FReply::Handled();
+}
+
+bool SHiroGeoImporterWindow::IsImportBusy() const
+{
+    return bBuildQueued || DownloadRequest.IsValid() || RetryTickerHandle.IsValid();
+}
+
+void SHiroGeoImporterWindow::QueueMapBuild(FString Path, double MinLat, double MinLon, double MaxLat, double MaxLon)
+{
+    if (bBuildQueued) return;
+    bBuildQueued = true;
+    const TWeakObjectPtr<UWorld> World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
+    if (GEditor && GEditor->GetEditorWorldContext().World())
+        SpawnHiroGeoActorAndBuild(MoveTemp(Path), MinLat, MinLon, MaxLat, MaxLon);
+    else
+        bBuildQueued = false;
 }
 
 ECheckBoxState SHiroGeoImporterWindow::GetLocalModeCheckState() const
@@ -1094,6 +1178,9 @@ void SHiroGeoImporterWindow::SaveWorldOrigin(UWorld* World, double Lat, double L
     const FString Section = FString::Printf(TEXT("HiroGeoImporter.%s"), *World->GetMapName());
     const FString Value = FString::Printf(TEXT("%.8f,%.8f"), Lat, Lon);
     GConfig->SetString(*Section, TEXT("OriginLatLon"), *Value, GEditorPerProjectIni);
+    // The first tile establishes both the horizontal origin and its elevation.
+    GConfig->RemoveKey(*Section, TEXT("OriginElevation"), GEditorPerProjectIni);
+    GConfig->RemoveKey(*Section, TEXT("OriginElevationInitialized"), GEditorPerProjectIni);
     GConfig->Flush(false, GEditorPerProjectIni);
 }
 
@@ -1175,21 +1262,18 @@ void SHiroGeoImporterWindow::SpawnHiroGeoActorAndBuild(FString OSMFilePath, doub
 
         // مش رو می‌سازیم - این کار MeshOriginLatitude/Longitude رو هم پر می‌کنه
         // (نقطه‌ی جغرافیایی واقعی که محل (0,0,0) محلی این مش به آن اشاره می‌کند)
-        NewActor->Generate();
-
-        // ====================================================================
-        // چینش صحیح در دنیا - باید بعد از Generate() انجام شود
-        //
-        // نکته مهم: مرکز bbox درخواستی (RequestedCenterLat/Lon) معمولاً دقیقاً
-        // همان نقطه‌ی جغرافیایی نیست که مرکز محلی (0,0,0) مش به آن اشاره می‌کند؛
-        // GeoMeshGenerator/HiroGeoActor مش را حول centroid واقعی دیتای
-        // بارگذاری‌شده (بعد از کلیپ) سنتر می‌کند، نه حول مرکز bbox درخواستی.
-        // اگر بر این اساس عمل نکنیم، هر کاشی به‌اندازه‌ی این اختلاف (که می‌تواند
-        // صدها متر باشد) جابه‌جا می‌شود و کاشی‌ها به‌جای کنار هم چیده شدن،
-        // پریشان/نامرتب می‌نشینند - دقیقاً همان مشکلی که قبلاً دیده می‌شد.
-        // پس همیشه از مقدار واقعی گزارش‌شده توسط خود اکتور استفاده می‌کنیم،
-        // نه از مرکز bbox که فقط یک تخمین اولیه‌ست.
-        // ====================================================================
+        NewActor->GenerateAsync(
+            [WeakActor = TWeakObjectPtr<AHiroGeoActor>(NewActor),
+             WeakWorld = TWeakObjectPtr<UWorld>(World), bAnyExisting, bHaveStoredOrigin,
+             OriginLat, OriginLon, RequestedCenterLat, RequestedCenterLon]
+        {
+        AHiroGeoActor* NewActor = WeakActor.Get();
+        UWorld* World = WeakWorld.Get();
+        if (!NewActor || !World || !GEditor || GEditor->GetEditorWorldContext().World() != World)
+        {
+            if (NewActor) NewActor->Destroy();
+            return;
+        }
         double PlacementLat = RequestedCenterLat;
         double PlacementLon = RequestedCenterLon;
         if (NewActor->HasMeshOrigin())
@@ -1216,22 +1300,35 @@ void SHiroGeoImporterWindow::SpawnHiroGeoActorAndBuild(FString OSMFilePath, doub
         // دستی از Content Browser). اینجا - بعد از Generate() - موقعیت نهایی
         // و صحیح رو ست می‌کنیم تا هم آن ریست override بشه و هم از مبدأ واقعی
         // مش (نه فقط مرکز bbox) استفاده شده باشه.
+        SpawnLocation.Z = NewActor->GetActorLocation().Z;
         NewActor->SetActorLocation(SpawnLocation);
 
         // اگه از حالت Grid اومده، این سل رو "استفاده‌شده" علامت بزن تا دوباره قابل انتخاب نباشه
-        if (!PendingCellKey.IsEmpty() && WebBrowser.IsValid())
+        },
+            [WeakWindow = TWeakPtr<SHiroGeoImporterWindow>(SharedThis(this)),
+             WeakActor = TWeakObjectPtr<AHiroGeoActor>(NewActor), CellKey = PendingCellKey](bool bSuccess)
         {
-            WebBrowser->ExecuteJavascript(FString::Printf(
-                TEXT("if(window.HiroGeoMarkCellUsed) window.HiroGeoMarkCellUsed('%s');"), *PendingCellKey));
+        const auto Window = WeakWindow.Pin();
+        if (Window)
+        {
+            Window->bBuildQueued = false;
+            Window->PendingCellKey.Reset();
         }
-        PendingCellKey.Empty();
-
-        // توجه: دیگه پنجره رو بعد از هر Generate نمی‌بندیم، چون در حالت Grid باید بشه پشت‌سرهم چند ناحیه وارد کرد
-        // اگه می‌خواید دوباره مثل قبل ببنده، این خط رو از کامنت خارج کنید:
-        // FSlateApplication::Get().FindWidgetWindow(AsShared())->RequestDestroyWindow();
+        if (!bSuccess)
+        {
+            if (AHiroGeoActor* Actor = WeakActor.Get()) Actor->Destroy();
+            return;
+        }
+        if (Window && !CellKey.IsEmpty() && Window->WebBrowser.IsValid())
+        {
+            Window->WebBrowser->ExecuteJavascript(FString::Printf(
+                TEXT("if(window.HiroGeoMarkCellUsed) window.HiroGeoMarkCellUsed('%s');"), *CellKey));
+        }
+        });
     }
     else
     {
+        bBuildQueued = false;
         UE_LOG(LogTemp, Error, TEXT("Failed to spawn HiroGeoActor"));
     }
 }

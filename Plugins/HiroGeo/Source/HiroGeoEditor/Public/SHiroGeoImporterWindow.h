@@ -120,6 +120,11 @@ private:
 
     // ---- فایل لوکال ----
     FReply OnSelectFileClicked();
+    FString SelectedLocalOsmPath;
+    bool IsImportBusy() const;
+    bool bBuildQueued = false;
+    void QueueMapBuild(FString Path, double MinLat = 0, double MinLon = 0,
+        double MaxLat = 0, double MaxLon = 0);
 
     // ---- world origin ----
     static bool LoadWorldOrigin(UWorld* World, double& OutLat, double& OutLon);
